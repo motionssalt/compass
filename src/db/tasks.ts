@@ -1,6 +1,6 @@
 import type { Task, TaskStatus } from '../types/task';
 import type { RecurrenceRule } from '../types/shared';
-import { nowIso, localWeekday } from '../utils/time';
+import { nowIso, localWeekday, localDateString } from '../utils/time';
 import {
   normalisePriorityToInt,
   DEFAULT_PRIORITY_INT,
@@ -39,9 +39,16 @@ export async function listTasksByFilter(
   }
 
   if (filter === 'today') {
-    // "Today" = open tasks that are recurring-due-today OR scheduled
-    // for today (loose match on the local date string).
-    const weekday = localWeekday(new Date(), timezone);
+    // "Today" = open tasks that are either
+    //   * recurring and due today (daily, or weekly matching today's weekday), or
+    //   * scheduled for today — accepting the literal word "today", or
+    //     an ISO date whose local calendar date equals today's, or
+    //   * unscheduled (scheduled_for is null/empty) — a freshly added
+    //     open task with no explicit schedule belongs on today's list;
+    //     otherwise newly created tasks never surface in /today.
+    const now = new Date();
+    const weekday = localWeekday(now, timezone);
+    const todayLocal = localDateString(now, timezone);
     const openTasks = await listOpenTasks(db, userId);
     return openTasks.filter((t) => {
       if (t.is_recurring) {
@@ -53,7 +60,12 @@ export async function listTasksByFilter(
         } catch { /* fall through */ }
         return false;
       }
-      if (t.scheduled_for && /today/i.test(t.scheduled_for)) return true;
+      const sched = t.scheduled_for?.trim();
+      if (!sched) return true;
+      if (/today/i.test(sched)) return true;
+      // ISO datetime / date prefix match against today's local date.
+      const isoDate = /^(\d{4}-\d{2}-\d{2})/.exec(sched);
+      if (isoDate && isoDate[1] === todayLocal) return true;
       return false;
     });
   }
