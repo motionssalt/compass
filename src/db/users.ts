@@ -46,6 +46,63 @@ export async function getUserTimezone(
   return row?.timezone || fallback;
 }
 
+/**
+ * Validate that `tz` is a real IANA timezone identifier the runtime
+ * recognises. We rely on `Intl.DateTimeFormat` throwing a RangeError
+ * for unknown zones — Cloudflare Workers ship the full ICU tz
+ * database, so this correctly accepts things like "America/New_York"
+ * or "Africa/Lagos" and rejects typos like "America/New_york" or
+ * "Nairobi".
+ *
+ * Fixed-offset strings ("UTC+3", "GMT-5") are deliberately rejected
+ * — DST transitions and future law changes make them unsafe for the
+ * daily-rollover / "today" logic that reads this column.
+ */
+export function isValidIanaTimezone(tz: string): boolean {
+  const trimmed = String(tz ?? '').trim();
+  if (!trimmed) return false;
+  // Must look like a Region/City identifier (also allowing "UTC" and
+  // a handful of legacy single-segment zones like "GMT", "Zulu").
+  // The Intl check below is the real gate; this cheap pre-check just
+  // filters out obviously-bogus values before touching Intl.
+  if (!/^[A-Za-z]+(?:[_+\-][A-Za-z0-9]+)*(?:\/[A-Za-z]+(?:[_+\-][A-Za-z0-9]+)*)*$/.test(trimmed)) {
+    return false;
+  }
+  try {
+    // Intl throws RangeError on unknown IANA identifiers.
+    new Intl.DateTimeFormat('en-US', { timeZone: trimmed });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Set the user's IANA timezone (e.g. "Africa/Nairobi"). Materialises
+ * a users row if one doesn't exist yet. Rejects invalid identifiers
+ * — the caller (slash command handler) is expected to surface a
+ * friendly usage message on rejection.
+ *
+ * Returns the stored (trimmed) identifier on success.
+ */
+export async function setUserTimezone(
+  db: D1Database, userId: number, tz: string,
+): Promise<string> {
+  const value = String(tz ?? '').trim();
+  if (!isValidIanaTimezone(value)) {
+    throw new Error('timezone must be a valid IANA identifier (e.g. America/New_York, Africa/Lagos)');
+  }
+  const now = nowIso();
+  await db.prepare(
+    `INSERT INTO users (user_id, timezone, created_at, updated_at)
+     VALUES (?1, ?2, ?3, ?3)
+     ON CONFLICT(user_id) DO UPDATE SET
+       timezone   = excluded.timezone,
+       updated_at = excluded.updated_at`,
+  ).bind(userId, value, now).run();
+  return value;
+}
+
 // ---------------------------------------------------------------
 // default currency
 // ---------------------------------------------------------------
