@@ -39,10 +39,22 @@ export interface TelegramMessage {
   audio?: TelegramAudio;
 }
 
+// Inline-keyboard callback query. Users tap a button; Telegram POSTs
+// this to us. We must answerCallbackQuery within a few seconds so the
+// client stops showing the loading spinner on the button.
+export interface TelegramCallbackQuery {
+  id: string;
+  from: TelegramUser;
+  message?: TelegramMessage;
+  chat_instance?: string;
+  data?: string;
+}
+
 export interface TelegramUpdate {
   update_id: number;
   message?: TelegramMessage;
   edited_message?: TelegramMessage;
+  callback_query?: TelegramCallbackQuery;
 }
 
 export interface TelegramFile {
@@ -50,4 +62,22 @@ export interface TelegramFile {
   file_unique_id: string;
   file_size?: number;
   file_path?: string;
+}
+
+// ---------------------------------------------------------------
+// Inline-keyboard shapes (send / edit message)
+// ---------------------------------------------------------------
+//
+// Kept minimal — we only build InlineKeyboardMarkup with `text` +
+// `callback_data` buttons (no URL / login buttons / etc.). Telegram
+// enforces `callback_data` <= 64 bytes; encoders in
+// src/handlers/menuUi.ts are responsible for staying under that.
+
+export interface InlineKeyboardButton {
+  text: string;
+  callback_data?: string;
+}
+
+export interface InlineKeyboardMarkup {
+  inline_keyboard: InlineKeyboardButton[][];
 }
