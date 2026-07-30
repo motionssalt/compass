@@ -4,7 +4,7 @@
 import type { Env } from '../types/env';
 import type { TelegramUpdate, TelegramMessage } from '../types/telegram';
 import { sendMessage, sendChatAction, getFileMeta, downloadFile } from '../services/telegram';
-import { upsertUser, getUserTimezone } from '../db/users';
+import { upsertUser, getUserTimezone, setUserTimezone, isValidIanaTimezone } from '../db/users';
 import { listTasksByFilter } from '../db/tasks';
 import { getBalance, setBalance } from '../db/balance';
 import { listOpenDebts } from '../db/debts';
@@ -139,7 +139,8 @@ async function handleSlashCommand(env: Env, msg: TelegramMessage): Promise<boole
         `/balance — current balance\n` +
         `/debts — open debts\n` +
         `/finance — balance + debts summary\n` +
-        `/setbalance <amount> [currency] — overwrite the balance directly\n\n` +
+        `/setbalance <amount> [currency] — overwrite the balance directly\n` +
+        `/timezone <IANA tz> — set your timezone (e.g. Africa/Lagos)\n\n` +
         `Voice notes work too.`,
       );
       return true;
@@ -247,6 +248,38 @@ async function handleSlashCommand(env: Env, msg: TelegramMessage): Promise<boole
     case '/review': {
       const reply = await cmdReviewFlexible(env, userId);
       await sendMessage(env, msg.chat.id, reply);
+      return true;
+    }
+
+    case '/timezone':
+    case '/tz': {
+      // Usage: /timezone <IANA tz name>
+      // Direct edit — no AI, no confirmation. Same trust model as
+      // /setbalance: if the user typed the command themselves, they
+      // meant it. Rejects anything that isn't a real IANA identifier
+      // so the daily-rollover logic that reads this column stays sane.
+      if (!argStr) {
+        const current = await getUserTimezone(env.DB, userId, env.DEFAULT_TIMEZONE);
+        await sendMessage(env, msg.chat.id,
+          `Usage: /timezone <IANA tz name>\nExample: /timezone America/New_York\nExample: /timezone Africa/Lagos\n\nCurrent: ${current}`);
+        return true;
+      }
+      // Take only the first whitespace-separated token — timezone
+      // identifiers never contain spaces, so anything after is user
+      // noise we don't want to feed into validation.
+      const candidate = argStr.split(/\s+/)[0];
+      if (!isValidIanaTimezone(candidate)) {
+        await sendMessage(env, msg.chat.id,
+          `"${candidate}" isn't a valid IANA timezone. Try something like /timezone America/New_York or /timezone Africa/Lagos.`);
+        return true;
+      }
+      const before = await getUserTimezone(env.DB, userId, env.DEFAULT_TIMEZONE);
+      const after = await setUserTimezone(env.DB, userId, candidate);
+      await sendMessage(env, msg.chat.id,
+        before === after
+          ? `Timezone stays ${after}.`
+          : `Timezone set: ${before} → ${after}`,
+      );
       return true;
     }
 
