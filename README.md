@@ -182,10 +182,33 @@ Worker.
 - BotFather replies with a **bot token** — copy it into the Cloudflare
   Worker secret `TELEGRAM_BOT_TOKEN` (step 3c).
 
-### 5b. Set the webhook (one curl from Termux):
+### 5b. Set the webhook
 
-Replace `<BOT_TOKEN>`, `<WORKER_URL>`, and `<SECRET>` below.
-`<SECRET>` must match `TELEGRAM_WEBHOOK_SECRET` you set on the Worker.
+You have two options. Either works; the admin endpoint is preferred
+because it keeps `allowed_updates` in sync with what the Worker code
+actually handles — no risk of forgetting `callback_query` and
+silently breaking the /menu buttons.
+
+**Option A — admin endpoint (recommended).** Once the Worker is
+deployed and `TELEGRAM_WEBHOOK_SECRET` is set on it, hit:
+
+```bash
+curl -X POST "<WORKER_URL>/admin/set-webhook" \
+  -H "X-Admin-Secret: <SECRET>"
+```
+
+`<SECRET>` is the same `TELEGRAM_WEBHOOK_SECRET`. You should see
+`{"ok":true,"url":"<WORKER_URL>/telegram","allowed_updates":[...]}`.
+Safe to re-run any time — e.g. after adding a new update type to the
+code, or to recover a deployment whose webhook was originally
+registered before `callback_query` support was added (existing
+deployments in that state must run this at least once, otherwise
+Telegram will keep silently dropping every inline-keyboard button
+tap even though the code handles them).
+
+**Option B — raw Telegram API.** Replace `<BOT_TOKEN>`, `<WORKER_URL>`,
+and `<SECRET>` below. `<SECRET>` must match `TELEGRAM_WEBHOOK_SECRET`
+you set on the Worker.
 
 ```bash
 curl -X POST "https://api.telegram.org/bot<BOT_TOKEN>/setWebhook" \
@@ -198,17 +221,21 @@ curl -X POST "https://api.telegram.org/bot<BOT_TOKEN>/setWebhook" \
 ```
 
 `callback_query` matters — that's how the inline-keyboard buttons in
-`/menu` are delivered.
+`/menu` are delivered. Once Telegram has an `allowed_updates` list on
+file it stays exactly as set until an explicit `setWebhook` overwrites
+it; omitting `callback_query` here silently breaks every /menu button
+tap without any error surfacing anywhere.
 
 You should see `{"ok":true,"result":true,...}`.
 
-Sanity check:
+Sanity check either option:
 
 ```bash
 curl "https://api.telegram.org/bot<BOT_TOKEN>/getWebhookInfo"
 ```
 
-`url` should point at your Worker, `pending_update_count` should be 0.
+`url` should point at your Worker, `pending_update_count` should be 0,
+and `allowed_updates` should include `callback_query`.
 
 ### 5c. Register the built-in Telegram command menu (one-time, optional but recommended)
 
@@ -226,9 +253,15 @@ curl -X POST "<WORKER_URL>/admin/register-commands" \
 ```
 
 `<SECRET>` is the same `TELEGRAM_WEBHOOK_SECRET`. You should see
-`{"ok":true,"registered":N}`. Aliases (`/add`, `/tz`, `/settings`,
-etc.) are intentionally not advertised — Telegram's menu shows one
-canonical entry per action; the aliases still work when typed.
+`{"ok":true,"registered":N,"webhook":{...}}`. This endpoint also
+re-syncs the webhook `allowed_updates` list (same job as
+`/admin/set-webhook`) so a single post-deploy curl covers both. If
+the webhook part fails, the response still returns `ok:true` for the
+command-menu refresh and reports the webhook error in
+`webhook_error` — hit `/admin/set-webhook` directly to retry.
+Aliases (`/add`, `/tz`, `/settings`, etc.) are intentionally not
+advertised — Telegram's menu shows one canonical entry per action;
+the aliases still work when typed.
 
 ---
 
