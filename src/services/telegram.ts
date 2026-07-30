@@ -163,6 +163,74 @@ export async function setMyCommands(
   }
 }
 
+/**
+ * The full list of update types this Worker actually handles. Kept as
+ * a single exported constant so the admin `setWebhook` hook and the
+ * README example can't drift apart.
+ *
+ * `callback_query` is REQUIRED for the inline-keyboard menu in
+ * src/handlers/buttons.ts — without it Telegram silently drops every
+ * button tap, and the /menu keyboard looks alive but does nothing.
+ * The bug that motivated this helper was exactly that: an existing
+ * deployment had its webhook registered with only
+ * ["message", "edited_message"] (a natural default before the button
+ * menu existed), and once Telegram has a non-empty allowed_updates on
+ * file it does NOT re-derive it from anywhere — it stays that way
+ * until an explicit setWebhook overwrites it.
+ */
+export const ALLOWED_UPDATES = [
+  'message',
+  'edited_message',
+  'callback_query',
+] as const;
+
+/**
+ * Register (or re-register) the Telegram webhook so it points at
+ * `<workerUrl>/telegram`, is guarded by the bot's shared secret, and
+ * — critically — has `callback_query` in its `allowed_updates` list.
+ *
+ * Idempotent: Telegram treats a repeat `setWebhook` with the same URL
+ * as a no-op (except for updating the allowed_updates / secret_token
+ * fields, which is exactly what we want here — that's the whole point
+ * of exposing this as a re-runnable admin action).
+ *
+ * `workerUrl` should be the base URL of the deployed Worker (no path,
+ * no trailing slash). We append `/telegram` here since the routing
+ * table in src/index.ts owns that path.
+ */
+export async function setWebhook(
+  env: Env, workerUrl: string,
+): Promise<{ url: string; allowed_updates: readonly string[] }> {
+  const base = workerUrl.replace(/\/+$/, '');
+  const webhookUrl = `${base}/telegram`;
+  const payload = {
+    url: webhookUrl,
+    secret_token: env.TELEGRAM_WEBHOOK_SECRET,
+    // Full replacement — Telegram stores this list verbatim and will
+    // silently drop any update type that isn't in it, so we must
+    // enumerate every type the Worker actually handles.
+    allowed_updates: ALLOWED_UPDATES,
+    // Fresh start: discard anything Telegram was holding under the
+    // old (broken) allowed_updates so button taps that piled up
+    // during the outage don't replay after the fix.
+    drop_pending_updates: true,
+  };
+  const resp = await fetch(apiUrl(env.TELEGRAM_BOT_TOKEN, 'setWebhook'), {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify(payload),
+  });
+  if (!resp.ok) {
+    const body = await resp.text().catch(() => '');
+    throw new Error(`setWebhook failed: ${resp.status} ${body}`);
+  }
+  const json = await resp.json() as { ok: boolean; description?: string };
+  if (!json.ok) {
+    throw new Error(`setWebhook rejected: ${json.description ?? 'unknown'}`);
+  }
+  return { url: webhookUrl, allowed_updates: ALLOWED_UPDATES };
+}
+
 function chunkText(text: string, size: number): string[] {
   if (text.length <= size) return [text];
   const out: string[] = [];
