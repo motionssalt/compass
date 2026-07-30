@@ -1,8 +1,17 @@
 # Motionsalt Compass
 
-A calm, conversational task manager that lives inside Telegram. You
+A calm, conversational life organizer that lives inside Telegram. You
 talk to it in text or voice; it manages your open tasks, recurring
-habits, and priorities behind the scenes.
+habits, priorities, your running balance, and the debts you owe (or
+are just holding cash for on someone else's behalf) — all behind the
+scenes.
+
+The finance side is deliberately a decision-support tool, not an
+expense tracker. When money arrives, Compass looks at your current
+balance and open debts and gives you one specific, low-effort
+suggestion for what to do with it. It knows the difference between
+debts that are yours and cash you're only passing through — it will
+never tell you to pay someone else's obligation from your own funds.
 
 Runs entirely on:
 
@@ -217,11 +226,24 @@ npx wrangler d1 execute motionsalt_compass --remote \
    explain briefly why.
 4. Send a **voice note** saying "add daily prayer as a recurring task".
    You should get back a confirmation about a new recurring task.
-5. Check the D1 console:
+5. Send: `I just got paid 500` — Compass should record it and, if you
+   have any open debts, suggest what to do with the new money.
+6. Send: `I owe my landlord 800 by the 5th` — it should create a debt
+   with `responsible_party = "user"`. Then try:
+   `that 300 is my mom's, I'm just holding it for her` — that one
+   should land as `responsible_party = "other"` and Compass should
+   NOT suggest paying it from your balance.
+7. Try the direct-read commands (no Gemini call, no quota burn):
+   `/today`, `/balance`, `/debts`, `/finance`, `/setbalance 1234.50`.
+8. Check the D1 console:
 
    ```sql
    SELECT id, title, status, priority, is_recurring, recurrence_rule
    FROM tasks ORDER BY id DESC LIMIT 10;
+
+   SELECT * FROM user_balance;
+   SELECT id, creditor, amount_cents, currency, responsible_party,
+          on_behalf_of, due, status FROM debts ORDER BY id DESC LIMIT 10;
    ```
 
 If any step fails, tail Worker logs from the Cloudflare dashboard
@@ -263,7 +285,8 @@ webhook at the tunnel URL.
 ```
 motionsalt-compass/
 ├── migrations/
-│   └── 0001_initial.sql          # tasks, api_keys, conversation_log, users
+│   ├── 0001_initial.sql          # tasks, api_keys, conversation_log, users
+│   └── 0002_finance.sql          # user_balance, debts, pending_confirmations
 ├── src/
 │   ├── index.ts                  # Worker entry (fetch + scheduled)
 │   ├── handlers/
@@ -309,3 +332,50 @@ fifth time. When you say "I'm tired", it recommends something lighter
 instead of pushing the biggest thing on the list. That behaviour lives
 in the system prompt (`src/ai/systemPrompt.ts`) — tweak it there if
 you want to shift the voice.
+
+---
+
+## Finance model (quick reference)
+
+**Storage.** All amounts live in D1 as INTEGER minor units (cents) to
+avoid floating-point drift. The runtime converts to/from decimal
+strings at the edges (`src/utils/money.ts`).
+
+**Balance.** One running balance per user in `user_balance`. Editable
+both via the AI (`record_income`, `record_spend`, `adjust_balance`,
+`set_balance`) and directly via `/setbalance`. Both paths converge on
+the same row.
+
+**Debts.** Everything owed lives in `debts`. The key field is
+`responsible_party`:
+
+- `'user'` — the user's own obligation. Compass may suggest paying
+  it from the balance and will decrement the balance when told to.
+- `'other'` — someone else's obligation the user is just holding
+  cash for (e.g. "this 300 is my mom's"). Compass will never suggest
+  paying it from the user's balance, and the `apply_payment_to_debt`
+  tool hard-refuses `from_balance=true` for such debts.
+
+**Confirm-before-execute.** Destructive financial actions require a
+two-step handshake via `pending_confirmations`:
+
+- `delete_debt` — always requires a confirm token.
+- `set_balance` — only when the new number is very different from
+  the current one (>=50% change AND >=100 units). Small corrections
+  are frictionless.
+
+Non-destructive actions (recording income, applying money to a debt,
+adjusting an amount, adding a new debt, cancelling a debt) do not
+need confirmation.
+
+**Direct-read fast paths.** These slash commands skip Gemini entirely
+so high-frequency reads and simple edits don't burn API quota:
+
+- `/today` — today's tasks
+- `/balance` — current balance
+- `/debts` — open debts
+- `/finance` — balance + debts summary (splits "you owe" vs.
+  "holding for others")
+- `/setbalance <amount> [currency]` — overwrite the balance directly.
+  If you typed the command yourself, Compass assumes you meant it and
+  skips the AI's large-overwrite confirmation gate.
