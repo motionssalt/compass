@@ -159,24 +159,33 @@ async function handleSlashCommand(env: Env, msg: TelegramMessage): Promise<boole
 
     case '/help':
       await sendMessage(env, msg.chat.id,
-        `Just talk to me normally. Some things you can try:\n` +
-        `• "I need to submit the report by Friday"\n` +
+        `Just talk to me normally — text or voice. Some things you can try:\n` +
+        `• "I need to submit the report by Friday, it's important"\n` +
         `• "add daily Bible study as a recurring task"\n` +
-        `• "what should I do now?"\n` +
-        `• "I'm tired — anything light?"\n` +
+        `• "what should I do now?"  or  "I'm tired — anything light?"\n` +
         `• "I'm done with the groceries"\n` +
         `• "I just got paid 500"\n` +
-        `• "I owe my landlord 800 by the 5th"\n` +
-        `• "that 300 is my mom's, I'm just holding it"\n\n` +
-        `Quick commands (no AI, no quota):\n` +
+        `• "I owe my landlord 800 by the 5th" (a recurring debt works too)\n` +
+        `• "that 300 is my mom's, I'm just holding it"\n` +
+        `• "set aside 200 for rent"\n\n` +
+        `Or drive me by typed commands (no AI, no quota).\n\n` +
+        `Tasks:\n` +
         `/today — today's tasks\n` +
+        `/addtask <title> [| p=A] [| dur=45] [| when=tonight] [| note=...] — add one task (also /add)\n` +
+        `/addbatch — add several tasks at once, one per line (also /batch)\n` +
+        `/edittask <id> [| field=value ...] — edit a task by id (also /edit)\n` +
+        `/review — list your flexible (unscheduled) tasks, highest priority first (also /flex)\n\n` +
+        `Finance:\n` +
         `/balance — current balance\n` +
         `/debts — open debts\n` +
-        `/finance — balance + debts summary\n` +
-        `/setbalance <amount> [currency] — overwrite the balance directly\n` +
-        `/timezone <IANA tz> — set your timezone (e.g. Africa/Lagos)\n` +
-        `/menu — button-driven access to tasks, finance, and settings\n\n` +
-        `Voice notes work too.`,
+        `/finance — balance + debts summary (splits "you owe" vs. "holding for others")\n` +
+        `/setbalance <amount> [currency] — overwrite the balance directly\n\n` +
+        `Settings:\n` +
+        `/timezone <IANA tz> — set your timezone, e.g. Africa/Lagos (also /tz)\n\n` +
+        `Prefer buttons? /menu opens a keyboard for Tasks, Finance, and Settings — including\n` +
+        `add/edit task, view balance & debts, move money to/from the set-aside bucket, and\n` +
+        `pick your default currency. /settings goes to the same menu.\n\n` +
+        `Voice notes work everywhere the AI does.`,
       );
       return true;
 
