@@ -6,6 +6,7 @@ import { resetDailyQuotas } from '../db/apiKeys';
 import { resetRecurringForDay } from '../db/tasks';
 import { reopenRecurringForDay } from '../db/debts';
 import { purgeExpiredConfirmations } from '../db/confirmations';
+import { purgeExpiredFlows } from '../db/flows';
 import { localDateString } from '../utils/time';
 import { log } from '../utils/logger';
 
@@ -20,6 +21,8 @@ export async function handleCron(env: Env): Promise<void> {
   // back to 'open'. Wiring lives in db/debts.reopenRecurringForDay.
   const debtsReopened = await reopenRecurringForDay(env.DB, tz);
   const confirmationsPurged = await purgeExpiredConfirmations(env.DB);
+  // Same housekeeping shape for the new button-flow state table.
+  const flowsPurged = await purgeExpiredFlows(env.DB);
 
   log.info('cron_daily_reset', {
     date: today,
@@ -27,5 +30,6 @@ export async function handleCron(env: Env): Promise<void> {
     recurring_tasks_reset: tasksReset,
     recurring_debts_reopened: debtsReopened,
     confirmations_purged: confirmationsPurged,
+    flows_purged: flowsPurged,
   });
 }
