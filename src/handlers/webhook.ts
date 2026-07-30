@@ -4,7 +4,11 @@
 import type { Env } from '../types/env';
 import type { TelegramUpdate, TelegramMessage } from '../types/telegram';
 import { sendMessage, sendChatAction, getFileMeta, downloadFile } from '../services/telegram';
-import { upsertUser } from '../db/users';
+import { upsertUser, getUserTimezone } from '../db/users';
+import { listTasksByFilter } from '../db/tasks';
+import { getBalance, setBalance } from '../db/balance';
+import { listOpenDebts } from '../db/debts';
+import { parseAmountToCents, formatMoney } from '../utils/money';
 import { runAgent } from '../ai/agent';
 import { arrayBufferToBase64 } from '../utils/base64';
 import { log } from '../utils/logger';
@@ -84,16 +88,31 @@ async function processMessage(env: Env, msg: TelegramMessage): Promise<void> {
   await sendMessage(env, msg.chat.id, reply);
 }
 
-/** Returns true if handled (and no further AI processing needed). */
+/**
+ * Returns true if handled (and no further AI processing needed).
+ *
+ * These direct-read fast paths deliberately skip Gemini so that
+ * cheap, high-frequency reads/edits ("show my balance", "today's
+ * tasks", "set balance to 500") don't burn API quota. AI-driven
+ * updates against the same underlying data (via runAgent) remain
+ * fully available in normal conversation.
+ */
 async function handleSlashCommand(env: Env, msg: TelegramMessage): Promise<boolean> {
-  const cmd = (msg.text ?? '').split(/\s+/)[0].toLowerCase().replace(/@.*$/, '');
+  const raw = (msg.text ?? '').trim();
+  const cmd = raw.split(/\s+/)[0].toLowerCase().replace(/@.*$/, '');
+  const argStr = raw.slice(raw.indexOf(cmd) + cmd.length).trim();
+  const userId = msg.from!.id;
+
   switch (cmd) {
     case '/start':
       await sendMessage(env, msg.chat.id,
         `Hi — I'm Compass. Tell me what's on your plate, or ask "what should I do now?" whenever you're stuck.\n\n` +
-        `I'll remember your open tasks, your recurring habits, and roughly what fits the moment. No pressure, no scolding — just steady help.`,
+        `I track your open tasks, your recurring habits, your running balance, and the debts you owe (or that you're just holding cash for). ` +
+        `When money arrives, tell me and I'll suggest exactly what to do with it. No pressure, no scolding — just steady help.\n\n` +
+        `Try /help to see quick commands.`,
       );
       return true;
+
     case '/help':
       await sendMessage(env, msg.chat.id,
         `Just talk to me normally. Some things you can try:\n` +
@@ -102,10 +121,117 @@ async function handleSlashCommand(env: Env, msg: TelegramMessage): Promise<boole
         `• "what should I do now?"\n` +
         `• "I'm tired — anything light?"\n` +
         `• "I'm done with the groceries"\n` +
-        `• "drop the dentist appointment, don't need it"\n\n` +
+        `• "I just got paid 500"\n` +
+        `• "I owe my landlord 800 by the 5th"\n` +
+        `• "that 300 is my mom's, I'm just holding it"\n\n` +
+        `Quick commands (no AI, no quota):\n` +
+        `/today — today's tasks\n` +
+        `/balance — current balance\n` +
+        `/debts — open debts\n` +
+        `/finance — balance + debts summary\n` +
+        `/setbalance <amount> [currency] — overwrite the balance directly\n\n` +
         `Voice notes work too.`,
       );
       return true;
+
+    case '/today': {
+      const tz = await getUserTimezone(env.DB, userId, env.DEFAULT_TIMEZONE);
+      const tasks = await listTasksByFilter(env.DB, userId, 'today', tz);
+      if (tasks.length === 0) {
+        await sendMessage(env, msg.chat.id, `Nothing on today's list. If something comes up, just tell me.`);
+        return true;
+      }
+      const lines = tasks.map((t) => {
+        const prefix = t.status === 'in_progress' ? '▶' : '•';
+        const bits = [`${prefix} #${t.id} ${t.title}`];
+        if (t.priority && t.priority !== 3) bits.push(`(p${t.priority})`);
+        if (t.scheduled_for) bits.push(`— ${t.scheduled_for}`);
+        return bits.join(' ');
+      });
+      await sendMessage(env, msg.chat.id, `Today:\n${lines.join('\n')}`);
+      return true;
+    }
+
+    case '/balance': {
+      const bal = await getBalance(env.DB, userId);
+      await sendMessage(env, msg.chat.id, `Balance: ${formatMoney(bal.amount_cents, bal.currency)}`);
+      return true;
+    }
+
+    case '/debts': {
+      const debts = await listOpenDebts(env.DB, userId);
+      if (debts.length === 0) {
+        await sendMessage(env, msg.chat.id, `No open debts.`);
+        return true;
+      }
+      const lines = debts.map((d) => {
+        const who = d.responsible_party === 'other'
+          ? ` [holding for ${d.on_behalf_of ?? 'someone else'}]`
+          : '';
+        const due = d.due ? ` — due ${d.due}` : '';
+        const urg = d.urgency && d.urgency !== 3 ? ` (u${d.urgency})` : '';
+        return `• #${d.id} ${d.creditor}: ${formatMoney(d.amount_cents, d.currency)}${who}${due}${urg}`;
+      });
+      await sendMessage(env, msg.chat.id, `Open debts:\n${lines.join('\n')}`);
+      return true;
+    }
+
+    case '/finance': {
+      const [bal, debts] = await Promise.all([
+        getBalance(env.DB, userId),
+        listOpenDebts(env.DB, userId),
+      ]);
+      const parts = [`Balance: ${formatMoney(bal.amount_cents, bal.currency)}`];
+      // Split totals so the user sees the "your own" number clearly.
+      const userDebts = debts.filter((d) => d.responsible_party === 'user');
+      const otherDebts = debts.filter((d) => d.responsible_party === 'other');
+      const sum = (arr: typeof debts) => arr.reduce((a, d) => a + d.amount_cents, 0);
+      if (userDebts.length) {
+        parts.push(`You owe: ${formatMoney(sum(userDebts), bal.currency)} across ${userDebts.length} debt${userDebts.length === 1 ? '' : 's'}`);
+      }
+      if (otherDebts.length) {
+        parts.push(`Holding for others: ${formatMoney(sum(otherDebts), bal.currency)} across ${otherDebts.length}`);
+      }
+      if (debts.length === 0) parts.push(`No open debts.`);
+      else {
+        parts.push('');
+        for (const d of debts) {
+          const who = d.responsible_party === 'other'
+            ? ` [for ${d.on_behalf_of ?? 'someone else'}]`
+            : '';
+          const due = d.due ? ` — due ${d.due}` : '';
+          parts.push(`• #${d.id} ${d.creditor}: ${formatMoney(d.amount_cents, d.currency)}${who}${due}`);
+        }
+      }
+      await sendMessage(env, msg.chat.id, parts.join('\n'));
+      return true;
+    }
+
+    case '/setbalance': {
+      // Usage: /setbalance <amount> [currency]
+      // Direct edit — deliberately does NOT go through the AI's
+      // confirm-large-overwrite gate. If the user typed the command
+      // themselves, they meant it.
+      if (!argStr) {
+        await sendMessage(env, msg.chat.id,
+          `Usage: /setbalance <amount> [currency]\nExample: /setbalance 1234.50\nExample: /setbalance 500 KES`);
+        return true;
+      }
+      const parts = argStr.split(/\s+/);
+      const cents = parseAmountToCents(parts[0]);
+      if (cents === null) {
+        await sendMessage(env, msg.chat.id, `Couldn't read "${parts[0]}" as an amount. Try /setbalance 1234.50`);
+        return true;
+      }
+      const currency = parts[1] ? parts[1].toUpperCase() : undefined;
+      const before = await getBalance(env.DB, userId);
+      const after = await setBalance(env.DB, userId, cents, currency);
+      await sendMessage(env, msg.chat.id,
+        `Balance set: ${formatMoney(before.amount_cents, before.currency)} → ${formatMoney(after.amount_cents, after.currency)}`,
+      );
+      return true;
+    }
+
     default:
       return false; // Unknown /command falls through to AI.
   }
