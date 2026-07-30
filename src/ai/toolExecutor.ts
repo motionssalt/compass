@@ -1,20 +1,28 @@
 // Bridges Gemini function calls to actual D1 operations.
 
 import type { Env } from '../types/env';
-import type { RecurrenceRule } from '../types/task';
+import type { RecurrenceRule } from '../types/shared';
 import type { ResponsibleParty } from '../types/finance';
 import {
   createTask, updateTaskStatus, cancelTask, listTasksByFilter,
   editTask, deleteTask,
 } from '../db/tasks';
-import { getUserTimezone } from '../db/users';
-import { getBalance, setBalance, adjustBalance } from '../db/balance';
+import {
+  getUserTimezone, setUserDefaultCurrency, getUserDefaultCurrency,
+} from '../db/users';
+import {
+  getBalance, setBalance, adjustBalance,
+  moveToSetAside, moveFromSetAside,
+} from '../db/balance';
 import {
   createDebt, editDebt, applyPaymentToDebt, markDebtPaid,
   cancelDebt, deleteDebt, listDebtsByFilter, getDebtById,
 } from '../db/debts';
 import { createConfirmation, consumeConfirmation } from '../db/confirmations';
 import { parseAmountToCents, formatCents, formatMoney } from '../utils/money';
+import {
+  priorityIntToLetter, isValidPriorityLetter,
+} from '../utils/priority';
 import { log } from '../utils/logger';
 
 export interface ToolCall {
@@ -44,7 +52,10 @@ export async function executeTool(
       case 'record_income':          return await handleRecordIncome(env, userId, call.args);
       case 'record_spend':           return await handleRecordSpend(env, userId, call.args);
       case 'adjust_balance':         return await handleAdjustBalance(env, userId, call.args);
+      case 'move_to_set_aside':      return await handleMoveToSetAside(env, userId, call.args);
+      case 'move_from_set_aside':    return await handleMoveFromSetAside(env, userId, call.args);
       case 'set_balance':            return await handleSetBalance(env, userId, call.args);
+      case 'set_default_currency':   return await handleSetDefaultCurrency(env, userId, call.args);
       case 'create_debt':            return await handleCreateDebt(env, userId, call.args);
       case 'edit_debt':              return await handleEditDebt(env, userId, call.args);
       case 'apply_payment_to_debt': return await handleApplyPayment(env, userId, call.args);
@@ -66,6 +77,55 @@ export async function executeTool(
 }
 
 // ---------------------------------------------------------------
+// decorators — attach human-readable fields for the model
+// ---------------------------------------------------------------
+
+/**
+ * When we return a task to Gemini we swap the stored priority
+ * integer for the letter grade the AI actually speaks. The raw
+ * integer is not exposed.
+ */
+function decorateTask(t: any) {
+  if (!t) return t;
+  const { priority, ...rest } = t;
+  return {
+    ...rest,
+    priority: priorityIntToLetter(priority),
+  };
+}
+
+/** Same idea for debts — `urgency` becomes a letter grade. */
+function decorateDebt(d: any) {
+  if (!d) return d;
+  const { urgency, amount_cents, currency, ...rest } = d;
+  return {
+    ...rest,
+    urgency: priorityIntToLetter(urgency),
+    amount_cents,
+    currency,
+    amount: formatCents(amount_cents),
+    _display: formatMoney(amount_cents, currency),
+  };
+}
+
+/**
+ * Balance decorator: adds display strings AND surfaces the set-aside
+ * bucket alongside the main balance so the model sees both.
+ */
+function decorateBalance(b: any) {
+  if (!b) return b;
+  const setAside = Number(b.set_aside_cents ?? 0);
+  return {
+    ...b,
+    amount: formatCents(b.amount_cents),
+    _display: formatMoney(b.amount_cents, b.currency),
+    set_aside_cents: setAside,
+    set_aside: formatCents(setAside),
+    set_aside_display: formatMoney(setAside, b.currency),
+  };
+}
+
+// ---------------------------------------------------------------
 // task handlers
 // ---------------------------------------------------------------
 
@@ -75,16 +135,29 @@ async function handleCreate(env: Env, userId: number, args: Record<string, unkno
     return { name: 'create_task', response: { ok: false, error: 'title is required' } };
   }
   const rule = args.recurrence_rule as RecurrenceRule | undefined;
+  const priorityArg = args.priority as string | number | undefined;
+  if (priorityArg !== undefined
+      && typeof priorityArg === 'string'
+      && !isValidPriorityLetter(priorityArg)) {
+    return {
+      name: 'create_task',
+      response: {
+        ok: false,
+        error: `priority must be a letter grade (A+..E-); got "${priorityArg}"`,
+      },
+    };
+  }
   const task = await createTask(env.DB, {
     user_id: userId,
     title,
-    priority: typeof args.priority === 'number' ? args.priority : 3,
+    priority: priorityArg,
     context_note: (args.context_note as string) ?? null,
     scheduled_for: (args.scheduled_for as string) ?? null,
     is_recurring: !!args.is_recurring,
     recurrence_rule: rule ?? null,
+    time_estimate_minutes: parseTimeEstimateArg(args.time_estimate_minutes),
   });
-  return { name: 'create_task', response: { ok: true, task } };
+  return { name: 'create_task', response: { ok: true, task: decorateTask(task) } };
 }
 
 async function handleUpdateStatus(env: Env, userId: number, args: Record<string, unknown>): Promise<ToolResult> {
@@ -96,7 +169,7 @@ async function handleUpdateStatus(env: Env, userId: number, args: Record<string,
   }
   const task = await updateTaskStatus(env.DB, userId, id, status);
   if (!task) return { name: 'update_task_status', response: { ok: false, error: 'task not found' } };
-  return { name: 'update_task_status', response: { ok: true, task } };
+  return { name: 'update_task_status', response: { ok: true, task: decorateTask(task) } };
 }
 
 async function handleCancel(env: Env, userId: number, args: Record<string, unknown>): Promise<ToolResult> {
@@ -104,31 +177,48 @@ async function handleCancel(env: Env, userId: number, args: Record<string, unkno
   if (!id) return { name: 'cancel_task', response: { ok: false, error: 'task_id required' } };
   const task = await cancelTask(env.DB, userId, id, (args.reason as string) ?? null);
   if (!task) return { name: 'cancel_task', response: { ok: false, error: 'task not found' } };
-  return { name: 'cancel_task', response: { ok: true, task } };
+  return { name: 'cancel_task', response: { ok: true, task: decorateTask(task) } };
 }
 
 async function handleList(env: Env, userId: number, args: Record<string, unknown>): Promise<ToolResult> {
   const filter = String(args.filter ?? 'pending') as any;
   const tz = await getUserTimezone(env.DB, userId, env.DEFAULT_TIMEZONE);
   const tasks = await listTasksByFilter(env.DB, userId, filter, tz);
-  return { name: 'list_tasks', response: { ok: true, filter, count: tasks.length, tasks } };
+  return {
+    name: 'list_tasks',
+    response: { ok: true, filter, count: tasks.length, tasks: tasks.map(decorateTask) },
+  };
 }
 
 async function handleEdit(env: Env, userId: number, args: Record<string, unknown>): Promise<ToolResult> {
   const id = Number(args.task_id);
   if (!id) return { name: 'edit_task', response: { ok: false, error: 'task_id required' } };
   const fields = (args.fields as Record<string, unknown>) ?? {};
+
+  if (fields.priority !== undefined
+      && typeof fields.priority === 'string'
+      && !isValidPriorityLetter(fields.priority)) {
+    return {
+      name: 'edit_task',
+      response: {
+        ok: false,
+        error: `priority must be a letter grade (A+..E-); got "${fields.priority}"`,
+      },
+    };
+  }
+
   const task = await editTask(env.DB, userId, id, {
     title: fields.title as string | undefined,
-    priority: fields.priority as number | undefined,
+    priority: fields.priority as string | number | undefined,
     context_note: fields.context_note as string | null | undefined,
     scheduled_for: fields.scheduled_for as string | null | undefined,
     is_recurring: fields.is_recurring as boolean | undefined,
     recurrence_rule: fields.recurrence_rule as RecurrenceRule | null | undefined,
     status: fields.status as any,
+    time_estimate_minutes: parseTimeEstimateArg(fields.time_estimate_minutes),
   });
   if (!task) return { name: 'edit_task', response: { ok: false, error: 'task not found' } };
-  return { name: 'edit_task', response: { ok: true, task } };
+  return { name: 'edit_task', response: { ok: true, task: decorateTask(task) } };
 }
 
 async function handleDelete(env: Env, userId: number, args: Record<string, unknown>): Promise<ToolResult> {
@@ -138,29 +228,24 @@ async function handleDelete(env: Env, userId: number, args: Record<string, unkno
   return { name: 'delete_task', response: { ok, deleted_id: id } };
 }
 
+/**
+ * Coerce a time-estimate tool argument into what tasks.ts expects:
+ *   - undefined stays undefined (leave field alone on edit)
+ *   - null / 0 / negative -> null (clears it)
+ *   - positive number -> that number of minutes
+ */
+function parseTimeEstimateArg(v: unknown): number | null | undefined {
+  if (v === undefined) return undefined;
+  if (v === null) return null;
+  const n = typeof v === 'number' ? v : Number(v);
+  if (!Number.isFinite(n)) return undefined;
+  if (n <= 0) return null;
+  return Math.round(n);
+}
+
 // ---------------------------------------------------------------
 // finance handlers
 // ---------------------------------------------------------------
-
-/**
- * When we return a finance object to Gemini, we always add a
- * `_display` field with the human-readable amount so the model
- * doesn't have to think about cents. Storage stays in cents.
- */
-function decorateDebt(d: any) {
-  return {
-    ...d,
-    amount: formatCents(d.amount_cents),
-    _display: formatMoney(d.amount_cents, d.currency),
-  };
-}
-function decorateBalance(b: any) {
-  return {
-    ...b,
-    amount: formatCents(b.amount_cents),
-    _display: formatMoney(b.amount_cents, b.currency),
-  };
-}
 
 async function handleRecordIncome(env: Env, userId: number, args: Record<string, unknown>): Promise<ToolResult> {
   const cents = parseAmountToCents(args.amount as string);
@@ -219,6 +304,44 @@ async function handleAdjustBalance(env: Env, userId: number, args: Record<string
   };
 }
 
+async function handleMoveToSetAside(env: Env, userId: number, args: Record<string, unknown>): Promise<ToolResult> {
+  const cents = parseAmountToCents(args.amount as string);
+  if (cents === null || cents <= 0) {
+    return { name: 'move_to_set_aside', response: { ok: false, error: 'amount required and must be positive' } };
+  }
+  const before = await getBalance(env.DB, userId);
+  const after = await moveToSetAside(env.DB, userId, cents);
+  return {
+    name: 'move_to_set_aside',
+    response: {
+      ok: true,
+      moved: formatCents(cents),
+      note: (args.note as string) ?? null,
+      balance_before: decorateBalance(before),
+      balance_after: decorateBalance(after),
+    },
+  };
+}
+
+async function handleMoveFromSetAside(env: Env, userId: number, args: Record<string, unknown>): Promise<ToolResult> {
+  const cents = parseAmountToCents(args.amount as string);
+  if (cents === null || cents <= 0) {
+    return { name: 'move_from_set_aside', response: { ok: false, error: 'amount required and must be positive' } };
+  }
+  const before = await getBalance(env.DB, userId);
+  const after = await moveFromSetAside(env.DB, userId, cents);
+  return {
+    name: 'move_from_set_aside',
+    response: {
+      ok: true,
+      moved: formatCents(cents),
+      note: (args.note as string) ?? null,
+      balance_before: decorateBalance(before),
+      balance_after: decorateBalance(after),
+    },
+  };
+}
+
 // Threshold for "big" overwrite. Beyond this we require a confirm
 // token. Kept deliberately conservative — cheap confirmation is
 // better than a silent destructive mistake.
@@ -232,7 +355,7 @@ async function handleSetBalance(env: Env, userId: number, args: Record<string, u
   }
   const currency = args.currency ? String(args.currency).toUpperCase() : undefined;
 
-  const before = await getBalance(env.DB, userId, currency ?? 'USD');
+  const before = await getBalance(env.DB, userId, currency);
   const diff = Math.abs(cents - before.amount_cents);
   const relDiff = before.amount_cents === 0 ? (cents === 0 ? 0 : 1) : diff / Math.abs(before.amount_cents);
   const needsConfirm = diff >= OVERWRITE_CONFIRM_ABS_CENTS && relDiff >= OVERWRITE_CONFIRM_REL;
@@ -269,6 +392,29 @@ async function handleSetBalance(env: Env, userId: number, args: Record<string, u
   };
 }
 
+async function handleSetDefaultCurrency(
+  env: Env, userId: number, args: Record<string, unknown>,
+): Promise<ToolResult> {
+  const raw = String(args.currency ?? '').trim();
+  if (!raw) {
+    return { name: 'set_default_currency', response: { ok: false, error: 'currency required' } };
+  }
+  try {
+    const code = await setUserDefaultCurrency(env.DB, userId, raw);
+    return {
+      name: 'set_default_currency',
+      response: {
+        ok: true,
+        default_currency: code,
+        note: 'Applies to new debts without explicit currency and to a first-time balance row. Existing balance currency unchanged.',
+      },
+    };
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    return { name: 'set_default_currency', response: { ok: false, error: msg } };
+  }
+}
+
 async function handleCreateDebt(env: Env, userId: number, args: Record<string, unknown>): Promise<ToolResult> {
   const creditor = String(args.creditor ?? '').trim();
   if (!creditor) {
@@ -284,13 +430,33 @@ async function handleCreateDebt(env: Env, userId: number, args: Record<string, u
   }
   const responsible = responsibleRaw as ResponsibleParty;
 
-  // Default currency = user's balance currency.
+  if (args.urgency !== undefined
+      && typeof args.urgency === 'string'
+      && !isValidPriorityLetter(args.urgency)) {
+    return {
+      name: 'create_debt',
+      response: {
+        ok: false,
+        error: `urgency must be a letter grade (A+..E-); got "${args.urgency}"`,
+      },
+    };
+  }
+
+  // Default currency:
+  //   1. explicit arg
+  //   2. user's stored default_currency
+  //   3. current balance currency
+  //   4. 'USD'
   let currency = args.currency ? String(args.currency).toUpperCase() : undefined;
+  if (!currency) {
+    currency = (await getUserDefaultCurrency(env.DB, userId)) ?? undefined;
+  }
   if (!currency) {
     const bal = await getBalance(env.DB, userId);
     currency = bal.currency;
   }
 
+  const rule = args.recurrence_rule as RecurrenceRule | undefined;
   const debt = await createDebt(env.DB, {
     user_id: userId,
     creditor,
@@ -299,8 +465,10 @@ async function handleCreateDebt(env: Env, userId: number, args: Record<string, u
     responsible_party: responsible,
     on_behalf_of: (args.on_behalf_of as string) ?? null,
     due: (args.due as string) ?? null,
-    urgency: typeof args.urgency === 'number' ? args.urgency : 3,
+    urgency: args.urgency as string | number | undefined,
     note: (args.note as string) ?? null,
+    is_recurring: !!args.is_recurring,
+    recurrence_rule: rule ?? null,
   });
   return { name: 'create_debt', response: { ok: true, debt: decorateDebt(debt) } };
 }
@@ -327,7 +495,18 @@ async function handleEditDebt(env: Env, userId: number, args: Record<string, unk
   }
   if (fields.on_behalf_of !== undefined) patch.on_behalf_of = fields.on_behalf_of as string | null;
   if (fields.due !== undefined) patch.due = fields.due as string | null;
-  if (fields.urgency !== undefined) patch.urgency = Number(fields.urgency);
+  if (fields.urgency !== undefined) {
+    if (typeof fields.urgency === 'string' && !isValidPriorityLetter(fields.urgency)) {
+      return {
+        name: 'edit_debt',
+        response: {
+          ok: false,
+          error: `urgency must be a letter grade (A+..E-); got "${fields.urgency}"`,
+        },
+      };
+    }
+    patch.urgency = fields.urgency as string | number;
+  }
   if (fields.note !== undefined) patch.note = fields.note as string | null;
   if (fields.status !== undefined) {
     const s = String(fields.status);
@@ -335,6 +514,10 @@ async function handleEditDebt(env: Env, userId: number, args: Record<string, unk
       return { name: 'edit_debt', response: { ok: false, error: `invalid status: ${s}` } };
     }
     patch.status = s;
+  }
+  if (fields.is_recurring !== undefined) patch.is_recurring = !!fields.is_recurring;
+  if (fields.recurrence_rule !== undefined) {
+    patch.recurrence_rule = fields.recurrence_rule as RecurrenceRule | null;
   }
 
   const debt = await editDebt(env.DB, userId, id, patch);
@@ -425,7 +608,7 @@ async function handleDeleteDebt(env: Env, userId: number, args: Record<string, u
 
 async function handleListDebts(env: Env, userId: number, args: Record<string, unknown>): Promise<ToolResult> {
   const filter = String(args.filter ?? 'open') as any;
-  if (!['open', 'paid', 'cancelled', 'user', 'other', 'all'].includes(filter)) {
+  if (!['open', 'paid', 'cancelled', 'user', 'other', 'all', 'recurring'].includes(filter)) {
     return { name: 'list_debts', response: { ok: false, error: `invalid filter: ${filter}` } };
   }
   const debts = await listDebtsByFilter(env.DB, userId, filter);
