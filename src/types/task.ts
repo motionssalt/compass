@@ -1,3 +1,5 @@
+import type { RecurrenceRule } from './shared';
+
 export type TaskStatus = 'pending' | 'in_progress' | 'done' | 'cancelled';
 
 export interface Task {
@@ -5,6 +7,11 @@ export interface Task {
   user_id: number;
   title: string;
   status: TaskStatus;
+  /**
+   * Stored INTEGER 1..15 mapping to A+..E- via src/utils/priority.ts.
+   * The letter grade is the only representation the AI and the user
+   * ever see; this integer is an internal storage detail.
+   */
   priority: number;
   context_note: string | null;
   scheduled_for: string | null;
@@ -12,12 +19,12 @@ export interface Task {
   recurrence_rule: string | null; // JSON string
   last_completed_at: string | null;
   cancel_reason: string | null;
+  /** Optional rough duration in minutes. Nullable — most tasks won't have one. */
+  time_estimate_minutes: number | null;
   created_at: string;
   updated_at: string;
 }
 
-export interface RecurrenceRule {
-  freq: 'daily' | 'weekly';
-  // For weekly: lowercase 3-letter day codes: mon, tue, wed, thu, fri, sat, sun
-  days?: string[];
-}
+// Re-exported for callers that used to import RecurrenceRule from
+// this module. New code should prefer importing from '../types/shared'.
+export type { RecurrenceRule };
