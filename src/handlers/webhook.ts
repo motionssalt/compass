@@ -8,10 +8,14 @@ import { upsertUser, getUserTimezone } from '../db/users';
 import { listTasksByFilter } from '../db/tasks';
 import { getBalance, setBalance } from '../db/balance';
 import { listOpenDebts } from '../db/debts';
+import { rememberChatId } from '../db/nudge';
 import { parseAmountToCents, formatMoney } from '../utils/money';
 import { priorityIntToLetter, DEFAULT_PRIORITY_INT } from '../utils/priority';
 import { runAgent } from '../ai/agent';
 import { arrayBufferToBase64 } from '../utils/base64';
+import {
+  cmdAddTask, cmdAddBatch, cmdEditTask, cmdReviewFlexible,
+} from './directTasks';
 import { log } from '../utils/logger';
 
 const TG_SECRET_HEADER = 'x-telegram-bot-api-secret-token';
@@ -53,6 +57,11 @@ export async function handleWebhook(req: Request, env: Env): Promise<Response> {
 async function processMessage(env: Env, msg: TelegramMessage): Promise<void> {
   const from = msg.from!;
   await upsertUser(env.DB, from.id, from.first_name ?? null, from.username ?? null);
+  // Capture the chat_id so the free-window nudge cron has a
+  // destination for outbound messages. Private chats have
+  // chat_id == user_id, but stashing it explicitly makes the
+  // assumption auditable.
+  await rememberChatId(env.DB, from.id, msg.chat.id);
 
   // Simple slash commands short-circuit the AI to save quota.
   if (msg.text && msg.text.startsWith('/')) {
@@ -209,6 +218,35 @@ async function handleSlashCommand(env: Env, msg: TelegramMessage): Promise<boole
         }
       }
       await sendMessage(env, msg.chat.id, parts.join('\n'));
+      return true;
+    }
+
+    case '/addtask':
+    case '/add': {
+      const reply = await cmdAddTask(env, userId, argStr);
+      await sendMessage(env, msg.chat.id, reply);
+      return true;
+    }
+
+    case '/addbatch':
+    case '/batch': {
+      const reply = await cmdAddBatch(env, userId, argStr);
+      await sendMessage(env, msg.chat.id, reply);
+      return true;
+    }
+
+    case '/edittask':
+    case '/edit': {
+      const reply = await cmdEditTask(env, userId, argStr);
+      await sendMessage(env, msg.chat.id, reply);
+      return true;
+    }
+
+    case '/flex':
+    case '/flexible':
+    case '/review': {
+      const reply = await cmdReviewFlexible(env, userId);
+      await sendMessage(env, msg.chat.id, reply);
       return true;
     }
 
