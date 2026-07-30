@@ -9,6 +9,7 @@ import { listTasksByFilter } from '../db/tasks';
 import { getBalance, setBalance } from '../db/balance';
 import { listOpenDebts } from '../db/debts';
 import { parseAmountToCents, formatMoney } from '../utils/money';
+import { priorityIntToLetter, DEFAULT_PRIORITY_INT } from '../utils/priority';
 import { runAgent } from '../ai/agent';
 import { arrayBufferToBase64 } from '../utils/base64';
 import { log } from '../utils/logger';
@@ -144,7 +145,9 @@ async function handleSlashCommand(env: Env, msg: TelegramMessage): Promise<boole
       const lines = tasks.map((t) => {
         const prefix = t.status === 'in_progress' ? '▶' : '•';
         const bits = [`${prefix} #${t.id} ${t.title}`];
-        if (t.priority && t.priority !== 3) bits.push(`(p${t.priority})`);
+        if (t.priority && t.priority !== DEFAULT_PRIORITY_INT) {
+          bits.push(`(${priorityIntToLetter(t.priority)})`);
+        }
         if (t.scheduled_for) bits.push(`— ${t.scheduled_for}`);
         return bits.join(' ');
       });
@@ -169,7 +172,9 @@ async function handleSlashCommand(env: Env, msg: TelegramMessage): Promise<boole
           ? ` [holding for ${d.on_behalf_of ?? 'someone else'}]`
           : '';
         const due = d.due ? ` — due ${d.due}` : '';
-        const urg = d.urgency && d.urgency !== 3 ? ` (u${d.urgency})` : '';
+        const urg = d.urgency && d.urgency !== DEFAULT_PRIORITY_INT
+          ? ` (${priorityIntToLetter(d.urgency)})`
+          : '';
         return `• #${d.id} ${d.creditor}: ${formatMoney(d.amount_cents, d.currency)}${who}${due}${urg}`;
       });
       await sendMessage(env, msg.chat.id, `Open debts:\n${lines.join('\n')}`);
