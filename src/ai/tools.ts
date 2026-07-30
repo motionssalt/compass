@@ -1,11 +1,15 @@
 // Gemini function-calling tool declarations. Types here mirror
 // Gemini's "functionDeclarations" spec exactly.
+//
+// Priority / urgency use a LETTER-GRADE scale (A+, A, A-, B+, B, B-,
+// C+, C, C-, D+, D, D-, E+, E, E-). See src/utils/priority.ts for
+// the canonical helper — the AI never sees the underlying integer.
 
 export const TOOL_DECLARATIONS = [
   {
     name: 'create_task',
     description:
-      'Create a new task for the user. Use this whenever the user mentions something they need to do, whether one-off or recurring.',
+      'Create a new task for the user. Use this whenever the user mentions something they need to do, whether one-off or recurring. ALWAYS supply a `priority` letter grade yourself — pick your best-judgment grade (A+..E-) based on how important and time-sensitive the task appears from what the user said (their words, urgency cues, whether it blocks other things, whether it names a deadline). Do not omit priority to fall back to a default; the user is relying on your judgment to infer it.',
     parameters: {
       type: 'OBJECT',
       properties: {
@@ -14,8 +18,9 @@ export const TOOL_DECLARATIONS = [
           description: 'Short human-readable name of the task.',
         },
         priority: {
-          type: 'INTEGER',
-          description: '1 highest, 3 normal, 5 lowest. Default 3.',
+          type: 'STRING',
+          description:
+            'Letter grade priority. One of: A+, A, A-, B+, B, B-, C+, C, C-, D+, D, D-, E+, E, E-. A+ = must happen now / blocking. A = today, high importance. B = this week, important. C = normal (baseline for a task with no urgency cues). D = nice-to-have / low. E = someday / drop-if-needed; E- = practically shelved. ALWAYS supply your best-judgment grade based on the task\'s apparent importance — do not omit this field.',
         },
         context_note: {
           type: 'STRING',
@@ -46,8 +51,13 @@ export const TOOL_DECLARATIONS = [
             },
           },
         },
+        time_estimate_minutes: {
+          type: 'INTEGER',
+          description:
+            'Optional rough duration in minutes. Set it when the user hints at how long the task takes ("quick 5-min call", "spend an hour on X", "half-day thing"); otherwise leave empty. Whole minutes, positive.',
+        },
       },
-      required: ['title'],
+      required: ['title', 'priority'],
     },
   },
   {
@@ -100,17 +110,20 @@ export const TOOL_DECLARATIONS = [
   },
   {
     name: 'edit_task',
-    description: 'Edit fields on an existing task (title, priority, context, scheduling, recurrence).',
+    description: 'Edit fields on an existing task (title, priority letter grade, context, scheduling, recurrence, time estimate).',
     parameters: {
       type: 'OBJECT',
       properties: {
         task_id: { type: 'INTEGER' },
         fields: {
           type: 'OBJECT',
-          description: 'Any subset of: title, priority, context_note, scheduled_for, is_recurring, recurrence_rule, status.',
+          description: 'Any subset of: title, priority (letter grade A+..E-), context_note, scheduled_for, is_recurring, recurrence_rule, status, time_estimate_minutes.',
           properties: {
             title: { type: 'STRING' },
-            priority: { type: 'INTEGER' },
+            priority: {
+              type: 'STRING',
+              description: 'Letter grade: A+, A, A-, B+, B, B-, C+, C, C-, D+, D, D-, E+, E, E-.',
+            },
             context_note: { type: 'STRING' },
             scheduled_for: { type: 'STRING' },
             is_recurring: { type: 'BOOLEAN' },
@@ -122,6 +135,10 @@ export const TOOL_DECLARATIONS = [
               },
             },
             status: { type: 'STRING' },
+            time_estimate_minutes: {
+              type: 'INTEGER',
+              description: 'Rough duration in minutes. Positive whole number; pass 0 or negative to clear it.',
+            },
           },
         },
       },
@@ -150,7 +167,7 @@ export const TOOL_DECLARATIONS = [
   {
     name: 'record_income',
     description:
-      'The user reports money arriving (paid, transfer received, cash in hand). Adds the amount to their running balance. Non-destructive — no confirmation needed. After calling this, look at open debts (especially the user\'s own, urgent ones) and give ONE specific, low-effort recommendation for what to do with the new money.',
+      'The user reports money arriving (paid, transfer received, cash in hand). Adds the amount to their running balance. Non-destructive — no confirmation needed. After calling this, look at open debts (especially the user\'s own, urgent ones) and give ONE specific, low-effort recommendation for what to do with the new money. If nothing obvious matches AND the user did not say what the money is for, ACT — call move_to_set_aside to park it in the set-aside bucket rather than leaving it loose in the main balance, then say plainly you parked it and will help decide later.',
     parameters: {
       type: 'OBJECT',
       properties: {
@@ -199,6 +216,41 @@ export const TOOL_DECLARATIONS = [
     },
   },
   {
+    name: 'move_to_set_aside',
+    description:
+      'Park money in the user\'s "set-aside / undecided" bucket — a separate per-user pool that lives alongside the main balance in the same currency. Use this ACTIVELY, not as a suggestion: when income arrives with no obvious use, when the user says "hold this for now" / "I don\'t know what this is for yet" / "save this bit", or when you\'d otherwise dump money into the main balance and hope the user remembers not to spend it. Non-destructive, no confirmation needed. Mirrors adjust_balance in style — just call it.',
+    parameters: {
+      type: 'OBJECT',
+      properties: {
+        amount: {
+          type: 'STRING',
+          description: 'The amount to move into the set-aside bucket, as a plain positive decimal string. Subtracted from the main balance and added to the bucket.',
+        },
+        note: {
+          type: 'STRING',
+          description: 'Optional short reason ("undecided", "holding for rent decision next week").',
+        },
+      },
+      required: ['amount'],
+    },
+  },
+  {
+    name: 'move_from_set_aside',
+    description:
+      'Move money out of the set-aside bucket back into the main balance, e.g. because the user has now decided what to do with it (about to spend it, apply to a debt, or just release it). Non-destructive, no confirmation needed. Mirrors move_to_set_aside in style.',
+    parameters: {
+      type: 'OBJECT',
+      properties: {
+        amount: {
+          type: 'STRING',
+          description: 'The amount to release from the bucket back to the main balance, as a plain positive decimal string.',
+        },
+        note: { type: 'STRING' },
+      },
+      required: ['amount'],
+    },
+  },
+  {
     name: 'set_balance',
     description:
       'Overwrite the running balance to an exact number. This REPLACES whatever is currently there — use it only when the user explicitly states their current total (e.g. "my balance is 4200 right now"). If the new value differs a lot from the current one (>50% change or >100 units in either direction), this action requires confirmation: call request_confirmation with action="overwrite_balance" first, then re-call set_balance in the next turn with the returned confirm_token.',
@@ -222,9 +274,24 @@ export const TOOL_DECLARATIONS = [
     },
   },
   {
+    name: 'set_default_currency',
+    description:
+      'Set the user\'s default currency (3-letter code, e.g. USD, KES, EUR). This is the currency used when a new balance row is materialised for the user and when create_debt is called without an explicit currency. Independent of any single balance edit — does NOT change the existing balance row\'s currency. Non-destructive, no confirmation needed. Call this the first time the user names their currency, or when they say "switch me to X by default".',
+    parameters: {
+      type: 'OBJECT',
+      properties: {
+        currency: {
+          type: 'STRING',
+          description: '3-letter currency code, e.g. USD, KES, EUR, GBP.',
+        },
+      },
+      required: ['currency'],
+    },
+  },
+  {
     name: 'create_debt',
     description:
-      'Record a new debt / obligation. IMPORTANT: responsible_party distinguishes debts the user owes themselves ("user") from money the user is holding for someone else to pay ("other"). Ask ONE short clarifying question if it is genuinely unclear — never assume "user" when the user hinted otherwise (e.g. "I owe my landlord but it\'s actually for mom"). Non-destructive.',
+      'Record a new debt / obligation. IMPORTANT: responsible_party distinguishes debts the user owes themselves ("user") from money the user is holding for someone else to pay ("other"). Ask ONE short clarifying question if it is genuinely unclear — never assume "user" when the user hinted otherwise (e.g. "I owe my landlord but it\'s actually for mom"). Non-destructive. If the debt is a repeating obligation (monthly rent, weekly subscription, biweekly bill), set is_recurring=true and provide a recurrence_rule — same shape as tasks. Supply your best-judgment `urgency` letter grade based on how soon and how consequential the debt is.',
     parameters: {
       type: 'OBJECT',
       properties: {
@@ -243,15 +310,36 @@ export const TOOL_DECLARATIONS = [
           type: 'STRING',
           description: 'Optional. ISO datetime OR loose text like "end of month", "next Friday", same pattern as task scheduled_for.',
         },
-        urgency: { type: 'INTEGER', description: '1 highest, 3 normal, 5 lowest. Default 3.' },
+        urgency: {
+          type: 'STRING',
+          description:
+            'Letter grade: A+, A, A-, B+, B, B-, C+, C, C-, D+, D, D-, E+, E, E-. A+ = pay today / severe consequence, A = this week, C = normal, E = shelvable. Supply your best-judgment grade.',
+        },
         note: { type: 'STRING', description: 'Optional free-text context.' },
+        is_recurring: {
+          type: 'BOOLEAN',
+          description: 'True for repeating obligations (rent, subscriptions, monthly bills). Defaults to false.',
+        },
+        recurrence_rule: {
+          type: 'OBJECT',
+          description:
+            'Only when is_recurring=true. Same shape as tasks: { "freq": "daily" } or { "freq": "weekly", "days": ["mon"] }.',
+          properties: {
+            freq: { type: 'STRING', description: '"daily" or "weekly"' },
+            days: {
+              type: 'ARRAY',
+              items: { type: 'STRING' },
+              description: 'For weekly only: mon,tue,wed,thu,fri,sat,sun.',
+            },
+          },
+        },
       },
-      required: ['creditor', 'amount'],
+      required: ['creditor', 'amount', 'urgency'],
     },
   },
   {
     name: 'edit_debt',
-    description: 'Edit fields on an existing debt (creditor, amount, responsible_party, on_behalf_of, due, urgency, note, status, currency). Non-destructive.',
+    description: 'Edit fields on an existing debt (creditor, amount, responsible_party, on_behalf_of, due, urgency letter grade, note, status, currency, is_recurring, recurrence_rule). Non-destructive.',
     parameters: {
       type: 'OBJECT',
       properties: {
@@ -265,9 +353,20 @@ export const TOOL_DECLARATIONS = [
             responsible_party: { type: 'STRING' },
             on_behalf_of: { type: 'STRING' },
             due: { type: 'STRING' },
-            urgency: { type: 'INTEGER' },
+            urgency: {
+              type: 'STRING',
+              description: 'Letter grade: A+, A, A-, B+, B, B-, C+, C, C-, D+, D, D-, E+, E, E-.',
+            },
             note: { type: 'STRING' },
             status: { type: 'STRING', description: 'One of: open, paid, cancelled.' },
+            is_recurring: { type: 'BOOLEAN' },
+            recurrence_rule: {
+              type: 'OBJECT',
+              properties: {
+                freq: { type: 'STRING' },
+                days: { type: 'ARRAY', items: { type: 'STRING' } },
+              },
+            },
           },
         },
       },
@@ -334,13 +433,13 @@ export const TOOL_DECLARATIONS = [
   {
     name: 'list_debts',
     description:
-      'Fetch debts from the DB. The system prompt already carries all open debts, so only call this for filters not covered there (paid history, cancelled, everything).',
+      'Fetch debts from the DB. The system prompt already carries all open debts, so only call this for filters not covered there (paid history, cancelled, everything, recurring set).',
     parameters: {
       type: 'OBJECT',
       properties: {
         filter: {
           type: 'STRING',
-          description: 'One of: open, paid, cancelled, user, other, all.',
+          description: 'One of: open, paid, cancelled, user, other, all, recurring.',
         },
       },
       required: ['filter'],
@@ -349,7 +448,7 @@ export const TOOL_DECLARATIONS = [
   {
     name: 'get_balance',
     description:
-      'Fetch the current running balance. The system prompt already contains it, so usually you do NOT need to call this — only if you suspect the snapshot is stale (e.g. after a chain of tool calls in the same turn).',
+      'Fetch the current running balance (and the set-aside bucket). The system prompt already contains both, so usually you do NOT need to call this — only if you suspect the snapshot is stale (e.g. after a chain of tool calls in the same turn).',
     parameters: { type: 'OBJECT', properties: {} },
   },
   {
