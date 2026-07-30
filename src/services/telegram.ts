@@ -2,6 +2,7 @@
 
 import type { Env } from '../types/env';
 import type { TelegramFile } from '../types/telegram';
+import type { BotCommand } from '../handlers/commandMenu';
 
 function apiUrl(token: string, method: string): string {
   return `https://api.telegram.org/bot${token}/${method}`;
@@ -55,6 +56,37 @@ export async function downloadFile(env: Env, filePath: string): Promise<ArrayBuf
   const resp = await fetch(url);
   if (!resp.ok) throw new Error(`downloadFile failed: ${resp.status}`);
   return await resp.arrayBuffer();
+}
+
+/**
+ * Register the bot's direct slash commands with Telegram so they
+ * appear in the built-in command menu (the "/" button UI on
+ * Telegram clients).
+ *
+ * Idempotent — Telegram treats this as a full replacement of the
+ * default-scope command list, so calling it repeatedly with the
+ * same input converges. Intended to run once per deploy from the
+ * admin init endpoint (see src/index.ts). Not wired into a cron;
+ * this list changes only when the code changes.
+ */
+export async function setMyCommands(
+  env: Env, commands: readonly BotCommand[],
+): Promise<void> {
+  const resp = await fetch(apiUrl(env.TELEGRAM_BOT_TOKEN, 'setMyCommands'), {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    // No `scope` / `language_code` — default scope covers all private
+    // chats and all locales, which is what we want for a personal bot.
+    body: JSON.stringify({ commands }),
+  });
+  if (!resp.ok) {
+    const body = await resp.text().catch(() => '');
+    throw new Error(`setMyCommands failed: ${resp.status} ${body}`);
+  }
+  const json = await resp.json() as { ok: boolean; description?: string };
+  if (!json.ok) {
+    throw new Error(`setMyCommands rejected: ${json.description ?? 'unknown'}`);
+  }
 }
 
 function chunkText(text: string, size: number): string[] {
