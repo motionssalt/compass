@@ -30,7 +30,18 @@ database_name = "motionsalt_compass"
 database_id = "602558fb-770e-465a-af53-c8747c54cee1"
 migrations_dir = "migrations"
 
-# Daily reset at 00:05 UTC: resets recurring tasks to pending and
-# refills API-key quotas.
+# Cron triggers:
+#   * "5 0 * * *"    — daily reset at 00:05 UTC: refills API-key
+#                       quotas, flips recurring tasks back to pending,
+#                       reopens recurring debts on their schedule,
+#                       purges expired confirmations. See
+#                       src/handlers/cron.ts.
+#   * "*/15 * * * *" — every 15 minutes: duration-aware free-time
+#                       nudger. Pure D1 + Telegram, no Gemini call.
+#                       See src/handlers/nudgeCron.ts.
+#
+# The scheduled() dispatcher in src/index.ts routes to the right
+# handler based on the incoming `event.cron` string, so both triggers
+# share the same Worker without stepping on each other.
 [triggers]
-crons = ["5 0 * * *"]
+crons = ["5 0 * * *", "*/15 * * * *"]
