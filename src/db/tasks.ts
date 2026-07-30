@@ -1,5 +1,10 @@
-import type { Task, TaskStatus, RecurrenceRule } from '../types/task';
+import type { Task, TaskStatus } from '../types/task';
+import type { RecurrenceRule } from '../types/shared';
 import { nowIso, localWeekday } from '../utils/time';
+import {
+  normalisePriorityToInt,
+  DEFAULT_PRIORITY_INT,
+} from '../utils/priority';
 
 // ---------------------------------------------------------------
 // Read
@@ -78,23 +83,30 @@ export async function getTaskById(
 export interface CreateTaskInput {
   user_id: number;
   title: string;
-  priority?: number;
+  /** Letter grade (A+..E-) or a normalised integer. See utils/priority.ts. */
+  priority?: string | number;
   context_note?: string | null;
   scheduled_for?: string | null;
   is_recurring?: boolean;
   recurrence_rule?: RecurrenceRule | null;
+  /** Optional rough duration in minutes. */
+  time_estimate_minutes?: number | null;
 }
 
 export async function createTask(db: D1Database, input: CreateTaskInput): Promise<Task> {
   const now = nowIso();
-  const priority = clampPriority(input.priority ?? 3);
+  const priority = input.priority === undefined
+    ? DEFAULT_PRIORITY_INT
+    : normalisePriorityToInt(input.priority);
   const ruleJson = input.recurrence_rule ? JSON.stringify(input.recurrence_rule) : null;
+  const timeEstimate = normaliseTimeEstimate(input.time_estimate_minutes);
 
   const result = await db.prepare(
     `INSERT INTO tasks
        (user_id, title, status, priority, context_note, scheduled_for,
-        is_recurring, recurrence_rule, created_at, updated_at)
-     VALUES (?1, ?2, 'pending', ?3, ?4, ?5, ?6, ?7, ?8, ?8)
+        is_recurring, recurrence_rule, time_estimate_minutes,
+        created_at, updated_at)
+     VALUES (?1, ?2, 'pending', ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?9)
      RETURNING *`,
   ).bind(
     input.user_id,
@@ -104,6 +116,7 @@ export async function createTask(db: D1Database, input: CreateTaskInput): Promis
     input.scheduled_for ?? null,
     input.is_recurring ? 1 : 0,
     ruleJson,
+    timeEstimate,
     now,
   ).first<Task>();
 
@@ -140,12 +153,14 @@ export async function cancelTask(
 
 export interface EditFields {
   title?: string;
-  priority?: number;
+  /** Letter grade (A+..E-) or a normalised integer. */
+  priority?: string | number;
   context_note?: string | null;
   scheduled_for?: string | null;
   is_recurring?: boolean;
   recurrence_rule?: RecurrenceRule | null;
   status?: TaskStatus;
+  time_estimate_minutes?: number | null;
 }
 
 export async function editTask(
@@ -156,7 +171,9 @@ export async function editTask(
 
   const merged = {
     title: fields.title ?? existing.title,
-    priority: fields.priority !== undefined ? clampPriority(fields.priority) : existing.priority,
+    priority: fields.priority !== undefined
+      ? normalisePriorityToInt(fields.priority)
+      : existing.priority,
     context_note: fields.context_note !== undefined ? fields.context_note : existing.context_note,
     scheduled_for: fields.scheduled_for !== undefined ? fields.scheduled_for : existing.scheduled_for,
     is_recurring: fields.is_recurring !== undefined
@@ -166,19 +183,24 @@ export async function editTask(
       ? (fields.recurrence_rule ? JSON.stringify(fields.recurrence_rule) : null)
       : existing.recurrence_rule,
     status: fields.status ?? existing.status,
+    time_estimate_minutes: fields.time_estimate_minutes !== undefined
+      ? normaliseTimeEstimate(fields.time_estimate_minutes)
+      : existing.time_estimate_minutes,
   };
 
   const row = await db.prepare(
     `UPDATE tasks
         SET title = ?3, priority = ?4, context_note = ?5, scheduled_for = ?6,
             is_recurring = ?7, recurrence_rule = ?8, status = ?9,
-            updated_at = ?10
+            time_estimate_minutes = ?10,
+            updated_at = ?11
       WHERE id = ?1 AND user_id = ?2
       RETURNING *`,
   ).bind(
     id, userId,
     merged.title, merged.priority, merged.context_note, merged.scheduled_for,
     merged.is_recurring, merged.recurrence_rule, merged.status,
+    merged.time_estimate_minutes,
     nowIso(),
   ).first<Task>();
 
@@ -233,7 +255,15 @@ export async function resetRecurringForDay(
   return resetCount;
 }
 
-function clampPriority(p: number): number {
-  if (!Number.isFinite(p)) return 3;
-  return Math.max(1, Math.min(5, Math.round(p)));
+// ---------------------------------------------------------------
+// helpers
+// ---------------------------------------------------------------
+
+function normaliseTimeEstimate(v: number | null | undefined): number | null {
+  if (v === null || v === undefined) return null;
+  if (!Number.isFinite(v)) return null;
+  const n = Math.round(v);
+  if (n <= 0) return null;
+  // A soft upper cap so a stray "1440000" doesn't land in the DB.
+  return Math.min(n, 60 * 24 * 30);
 }
