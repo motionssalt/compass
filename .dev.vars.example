@@ -1,0 +1,3 @@
+# Copy to `.dev.vars` for local `wrangler dev` runs. Do NOT commit .dev.vars.
+TELEGRAM_BOT_TOKEN="123456:REPLACE_ME"
+TELEGRAM_WEBHOOK_SECRET="pick-any-long-random-string"
