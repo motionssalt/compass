@@ -27,8 +27,10 @@ import {
 } from '../services/telegram';
 import { upsertUser, getUserTimezone, setUserTimezone, isValidIanaTimezone, setUserDefaultCurrency } from '../db/users';
 import {
-  listTasksByFilter, listOpenTasks, createTask, editTask, getTaskById,
+  listTasksByFilter, listOpenTasks, listAllOpenTasks,
+  createTask, editTask, deleteTask, getTaskById,
 } from '../db/tasks';
+import { resetUserData } from '../db/reset';
 import {
   getBalance, setBalance, adjustBalance, moveToSetAside, moveFromSetAside,
 } from '../db/balance';
@@ -53,7 +55,7 @@ import {
   taskPickerKeyboard, editFieldKeyboard, statusPickerKeyboard,
   timezoneKeyboard, TZ_SLOTS,
   currencyKeyboard, CURRENCY_SLOTS,
-  overwriteConfirmKeyboard,
+  overwriteConfirmKeyboard, deleteTaskConfirmKeyboard, resetConfirmKeyboard,
 } from './menuUi';
 import { log } from '../utils/logger';
 
@@ -89,7 +91,7 @@ export async function processCallbackQuery(
     } else if (decoded.domain === 'nav') {
       ackText = await handleNav(env, cq, decoded.action);
     } else if (decoded.domain === 'tasks') {
-      ackText = await handleTasks(env, cq, decoded.action);
+      ackText = await handleTasks(env, cq, decoded.action, decoded.args);
     } else if (decoded.domain === 'fin') {
       ackText = await handleFinance(env, cq, decoded.action, decoded.args);
     } else if (decoded.domain === 'set') {
@@ -177,7 +179,7 @@ async function handleNav(
 // ---------------------------------------------------------------
 
 async function handleTasks(
-  env: Env, cq: TelegramCallbackQuery, action: string,
+  env: Env, cq: TelegramCallbackQuery, action: string, args: string[],
 ): Promise<string | undefined> {
   const msg = cq.message;
   if (!msg) return 'no message context';
@@ -230,6 +232,63 @@ async function handleTasks(
       taskPickerKeyboard(open, 'edit'),
     );
     return;
+  }
+
+  if (action === 'all') {
+    // Every open task regardless of scheduled date — today +
+    // non-today combined. Recurring tasks appear ONCE here.
+    const tasks = await listAllOpenTasks(env.DB, userId);
+    const body = tasks.length === 0
+      ? `No open tasks. Everything is either done or you haven't added anything yet.`
+      : `All open tasks (${tasks.length}):\n${tasks.map(formatTaskLine).join('\n')}`;
+    await editOrSend(env, msg, body, tasksMenuKeyboard());
+    return;
+  }
+
+  if (action === 'delpick') {
+    // Show the same task list the edit-picker uses — same underlying
+    // listOpenTasks query, no forked ordering. Tapping a row will
+    // fire a `flow:tpick:delete:<id>` callback that lands on the
+    // confirm gate below.
+    const open = await listOpenTasks(env.DB, userId);
+    if (open.length === 0) {
+      await editOrSend(env, msg, `No open tasks to delete.`, tasksMenuKeyboard());
+      return;
+    }
+    await editOrSend(env, msg,
+      `Pick a task to delete:`,
+      taskPickerKeyboard(open, 'delete'),
+    );
+    return;
+  }
+
+  if (action === 'delok') {
+    // Delete-task confirmation button: reuse the same
+    // pending_confirmations token the AI-side delete_debt flow uses.
+    const token = args[0];
+    if (!token) return 'no token';
+    const row = await consumeConfirmation(env.DB, userId, token);
+    if (!row || row.action !== 'delete_task') {
+      await editOrSend(env, msg,
+        `That confirmation link is stale — try Delete task again.`,
+        tasksMenuKeyboard(),
+      );
+      return 'expired';
+    }
+    const payload = safeParse<{ task_id: number }>(row.payload);
+    const id = payload?.task_id;
+    if (!id) {
+      await editOrSend(env, msg, `Bad confirmation payload.`, tasksMenuKeyboard());
+      return;
+    }
+    // Route through the SAME deleteTask helper /delete_task (AI) uses.
+    const ok = await deleteTask(env.DB, userId, id);
+    await editOrSend(env, msg,
+      ok ? `Deleted task #${id}.` : `No task #${id} — nothing to delete.`,
+      tasksMenuKeyboard(),
+    );
+    await clearFlow(env.DB, userId);
+    return ok ? 'deleted' : 'not found';
   }
 
   return 'unknown';
@@ -421,6 +480,46 @@ async function handleSettings(
     return;
   }
 
+  if (action === 'reset') {
+    // Ask for confirmation via the SAME pending_confirmations flow
+    // used for delete_debt and overwrite_balance. No wipe happens
+    // here — that's on the `resetok` branch below.
+    const summary = `Wipe ALL your data: tasks, debts, balance & set-aside, timezone, default currency. Your saved Gemini API key is kept.`;
+    const conf = await createConfirmation(env.DB, userId, 'reset_user_data', {}, summary);
+    await editOrSend(env, msg,
+      `${summary}\n\nThis can't be undone. Confirm?`,
+      resetConfirmKeyboard(conf.token),
+    );
+    return;
+  }
+
+  if (action === 'resetok') {
+    const token = args[0];
+    if (!token) return 'no token';
+    const row = await consumeConfirmation(env.DB, userId, token);
+    if (!row || row.action !== 'reset_user_data') {
+      await editOrSend(env, msg,
+        `That confirmation link is stale — try Reset all data again.`,
+        settingsMenuKeyboard(),
+      );
+      return 'expired';
+    }
+    const counts = await resetUserData(env.DB, userId);
+    const lines = [
+      `Done. Wiped:`,
+      `• ${counts.tasks} task${counts.tasks === 1 ? '' : 's'}`,
+      `• ${counts.debts} debt${counts.debts === 1 ? '' : 's'}`,
+      `• balance & set-aside`,
+      `• timezone & default currency`,
+      `• chat history and pending state`,
+      ``,
+      `Your saved Gemini API key was kept. Send me anything to start fresh.`,
+    ];
+    await editOrSend(env, msg, lines.join('\n'), rootMenuKeyboard());
+    await clearFlow(env.DB, userId);
+    return 'reset';
+  }
+
   return 'unknown';
 }
 
@@ -489,15 +588,28 @@ async function handleFlow(
     return 'unknown purpose';
   }
 
-  // Task-picker for edit-task.
+  // Task-picker for edit-task or delete-task.
   if (action === 'tpick') {
-    if (args[0] !== 'edit') return 'unknown purpose';
+    const purpose = args[0];
+    if (purpose !== 'edit' && purpose !== 'delete') return 'unknown purpose';
     const id = parseInt(args[1] ?? '', 10);
     if (!Number.isFinite(id) || id <= 0) return 'bad id';
     const existing = await getTaskById(env.DB, userId, id);
     if (!existing) {
       await editOrSend(env, msg, `That task is gone. Try again.`, tasksMenuKeyboard());
       await clearFlow(env.DB, userId);
+      return;
+    }
+    if (purpose === 'delete') {
+      // Second-stage gate — same pending_confirmations mechanism the
+      // AI-side delete_debt flow and overwrite_balance flow use.
+      const summary = `Delete task #${id} "${existing.title}"`;
+      const conf = await createConfirmation(env.DB, userId, 'delete_task',
+        { task_id: id }, summary);
+      await editOrSend(env, msg,
+        `${summary}\n\nThis removes the task permanently (not just cancel). Confirm?`,
+        deleteTaskConfirmKeyboard(conf.token),
+      );
       return;
     }
     await startFlow(env.DB, userId, 'edit_task', 'await_field',
