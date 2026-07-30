@@ -2,8 +2,8 @@
 // deserialises the update, and dispatches to the agent.
 
 import type { Env } from '../types/env';
-import type { TelegramUpdate, TelegramMessage } from '../types/telegram';
-import { sendMessage, sendChatAction, getFileMeta, downloadFile } from '../services/telegram';
+import type { TelegramUpdate, TelegramMessage, TelegramCallbackQuery } from '../types/telegram';
+import { sendMessage, sendChatAction, getFileMeta, downloadFile, answerCallbackQuery } from '../services/telegram';
 import { upsertUser, getUserTimezone, setUserTimezone, isValidIanaTimezone } from '../db/users';
 import { listTasksByFilter } from '../db/tasks';
 import { getBalance, setBalance } from '../db/balance';
@@ -16,6 +16,9 @@ import { arrayBufferToBase64 } from '../utils/base64';
 import {
   cmdAddTask, cmdAddBatch, cmdEditTask, cmdReviewFlexible,
 } from './directTasks';
+import {
+  processCallbackQuery, openMenu, tryHandleFlowText,
+} from './buttons';
 import { log } from '../utils/logger';
 
 const TG_SECRET_HEADER = 'x-telegram-bot-api-secret-token';
@@ -33,14 +36,36 @@ export async function handleWebhook(req: Request, env: Env): Promise<Response> {
     return new Response('bad json', { status: 400 });
   }
 
-  const msg = update.message ?? update.edited_message;
-  if (!msg || !msg.from) {
-    return new Response('ok'); // Ignore non-message updates silently.
+  const ctx = (globalThis as any).__ctx as ExecutionContext | undefined;
+
+  // Route by update type. Both branches follow the same "return 200
+  // to Telegram immediately, do the work in the background" pattern
+  // so a slow branch never causes Telegram to retry.
+
+  if (update.callback_query) {
+    const cq = update.callback_query;
+    const work = processCallbackQuery(env, cq).catch(async (err) => {
+      log.error('processCallbackQuery failed', {
+        err: err instanceof Error ? err.message : String(err),
+      });
+      // Always answer the callback, even on total failure, so the
+      // user's tap doesn't hang with a loading spinner.
+      await answerCallbackQuery(env, cq.id, 'Something jammed. Try /menu again.').catch(() => {});
+      const chatId = cq.message?.chat.id;
+      if (chatId !== undefined) {
+        await safeSendError(env, chatId).catch(() => {});
+      }
+    });
+    if (ctx?.waitUntil) ctx.waitUntil(work);
+    else await work;
+    return new Response('ok');
   }
 
-  // Return 200 to Telegram immediately, do the work in the background.
-  // This prevents Telegram from retrying if Gemini is slow.
-  const ctx = (globalThis as any).__ctx as ExecutionContext | undefined;
+  const msg = update.message ?? update.edited_message;
+  if (!msg || !msg.from) {
+    return new Response('ok'); // Ignore anything else (e.g. channel posts).
+  }
+
   const work = processMessage(env, msg).catch((err) => {
     log.error('processMessage failed', {
       err: err instanceof Error ? err.message : String(err),
@@ -66,6 +91,15 @@ async function processMessage(env: Env, msg: TelegramMessage): Promise<void> {
   // Simple slash commands short-circuit the AI to save quota.
   if (msg.text && msg.text.startsWith('/')) {
     if (await handleSlashCommand(env, msg)) return;
+  }
+
+  // If a button-driven flow is waiting on the user's next free-text
+  // reply, consume the message here (no AI, no direct-command path).
+  // This runs AFTER the slash-command dispatch above, so a user can
+  // always break out of a stuck flow with /menu or any other slash.
+  if (msg.text && !msg.text.startsWith('/')) {
+    const consumed = await tryHandleFlowText(env, msg, msg.text);
+    if (consumed) return;
   }
 
   await sendChatAction(env, msg.chat.id, 'typing');
@@ -119,7 +153,7 @@ async function handleSlashCommand(env: Env, msg: TelegramMessage): Promise<boole
         `Hi — I'm Compass. Tell me what's on your plate, or ask "what should I do now?" whenever you're stuck.\n\n` +
         `I track your open tasks, your recurring habits, your running balance, and the debts you owe (or that you're just holding cash for). ` +
         `When money arrives, tell me and I'll suggest exactly what to do with it. No pressure, no scolding — just steady help.\n\n` +
-        `Try /help to see quick commands.`,
+        `Try /help to see quick commands, or /menu to drive me by buttons.`,
       );
       return true;
 
@@ -140,10 +174,20 @@ async function handleSlashCommand(env: Env, msg: TelegramMessage): Promise<boole
         `/debts — open debts\n` +
         `/finance — balance + debts summary\n` +
         `/setbalance <amount> [currency] — overwrite the balance directly\n` +
-        `/timezone <IANA tz> — set your timezone (e.g. Africa/Lagos)\n\n` +
+        `/timezone <IANA tz> — set your timezone (e.g. Africa/Lagos)\n` +
+        `/menu — button-driven access to tasks, finance, and settings\n\n` +
         `Voice notes work too.`,
       );
       return true;
+
+    case '/menu':
+    case '/settings': {
+      // /menu is the canonical entry point; /settings is a familiar
+      // alias for the same top-level keyboard (the Settings submenu
+      // is one tap in).
+      await openMenu(env, msg.chat.id);
+      return true;
+    }
 
     case '/today': {
       const tz = await getUserTimezone(env.DB, userId, env.DEFAULT_TIMEZONE);
