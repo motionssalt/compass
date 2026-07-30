@@ -21,6 +21,13 @@ export interface Task {
   cancel_reason: string | null;
   /** Optional rough duration in minutes. Nullable — most tasks won't have one. */
   time_estimate_minutes: number | null;
+  /**
+   * ISO timestamp of the last time the free-window nudger surfaced
+   * this task. Null before any nudge. Used purely as a fairness
+   * signal by the nudge scorer — down-ranks a task that was just
+   * shown so the user isn't shown the same one over and over.
+   */
+  last_nudged_at: string | null;
   created_at: string;
   updated_at: string;
 }
