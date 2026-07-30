@@ -8,6 +8,8 @@ import { generate, type GeminiContent, type GeminiPart } from './gemini';
 import { executeTool, type ToolCall } from './toolExecutor';
 import { listOpenTasks } from '../db/tasks';
 import { getUserTimezone } from '../db/users';
+import { getBalance } from '../db/balance';
+import { listOpenDebts } from '../db/debts';
 import { recentMessages, appendMessage, pruneOld } from '../db/conversation';
 import { log } from '../utils/logger';
 
@@ -23,11 +25,17 @@ export interface AgentInput {
 
 export async function runAgent(env: Env, input: AgentInput): Promise<string> {
   const tz = await getUserTimezone(env.DB, input.userId, env.DEFAULT_TIMEZONE);
-  const openTasks = await listOpenTasks(env.DB, input.userId);
+  const [openTasks, balance, openDebts] = await Promise.all([
+    listOpenTasks(env.DB, input.userId),
+    getBalance(env.DB, input.userId),
+    listOpenDebts(env.DB, input.userId),
+  ]);
   const systemInstruction = buildSystemPrompt({
     userFirstName: input.firstName,
     timezone: tz,
     openTasks,
+    balance,
+    openDebts,
   });
 
   const historyLimit = parseInt(env.CONVERSATION_HISTORY_LIMIT, 10) || 20;
