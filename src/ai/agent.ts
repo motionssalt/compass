@@ -7,7 +7,7 @@ import { buildSystemPrompt } from './systemPrompt';
 import { generate, type GeminiContent, type GeminiPart } from './gemini';
 import { executeTool, type ToolCall } from './toolExecutor';
 import { listOpenTasks } from '../db/tasks';
-import { getUserTimezone } from '../db/users';
+import { getUserTimezone, getUserDefaultCurrency } from '../db/users';
 import { getBalance } from '../db/balance';
 import { listOpenDebts } from '../db/debts';
 import { recentMessages, appendMessage, pruneOld } from '../db/conversation';
@@ -25,10 +25,11 @@ export interface AgentInput {
 
 export async function runAgent(env: Env, input: AgentInput): Promise<string> {
   const tz = await getUserTimezone(env.DB, input.userId, env.DEFAULT_TIMEZONE);
-  const [openTasks, balance, openDebts] = await Promise.all([
+  const [openTasks, balance, openDebts, defaultCurrency] = await Promise.all([
     listOpenTasks(env.DB, input.userId),
     getBalance(env.DB, input.userId),
     listOpenDebts(env.DB, input.userId),
+    getUserDefaultCurrency(env.DB, input.userId),
   ]);
   const systemInstruction = buildSystemPrompt({
     userFirstName: input.firstName,
@@ -36,6 +37,7 @@ export async function runAgent(env: Env, input: AgentInput): Promise<string> {
     openTasks,
     balance,
     openDebts,
+    defaultCurrency,
   });
 
   const historyLimit = parseInt(env.CONVERSATION_HISTORY_LIMIT, 10) || 20;
