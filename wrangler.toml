@@ -27,7 +27,7 @@ CONVERSATION_HISTORY_LIMIT = "20"
 [[d1_databases]]
 binding = "DB"
 database_name = "motionsalt_compass"
-database_id = "REPLACE_WITH_YOUR_D1_DATABASE_ID"
+database_id = "602558fb-770e-465a-af53-c8747c54cee1"
 migrations_dir = "migrations"
 
 # Daily reset at 00:05 UTC: resets recurring tasks to pending and
