@@ -1,17 +1,21 @@
 import type { Task } from '../types/task';
+import type { BalanceRow, DebtRow } from '../types/finance';
+import { formatMoney } from '../utils/money';
 import { localTimeOfDay, localWeekday, localDateString } from '../utils/time';
 
 /**
  * Build the system prompt that establishes Compass's voice AND injects
- * the live task state. Every turn gets a fresh snapshot so the model
- * never has to guess what's open.
+ * the live task + finance state. Every turn gets a fresh snapshot so
+ * the model never has to guess what's open or what the balance is.
  */
 export function buildSystemPrompt(params: {
   userFirstName: string | null;
   timezone: string;
   openTasks: Task[];
+  balance: BalanceRow;
+  openDebts: DebtRow[];
 }): string {
-  const { userFirstName, timezone, openTasks } = params;
+  const { userFirstName, timezone, openTasks, balance, openDebts } = params;
   const now = new Date();
   const dateStr = localDateString(now, timezone);
   const weekday = localWeekday(now, timezone);
@@ -35,6 +39,24 @@ export function buildSystemPrompt(params: {
       }).join('\n')
     : '(no open tasks right now)';
 
+  const debtLines = openDebts.length
+    ? openDebts.map((d) => {
+        const bits = [
+          `#${d.id}`,
+          `owed_to="${d.creditor}"`,
+          `amount=${formatMoney(d.amount_cents, d.currency)}`,
+          `responsible=${d.responsible_party}`,
+        ];
+        if (d.responsible_party === 'other' && d.on_behalf_of) {
+          bits.push(`on_behalf_of="${d.on_behalf_of}"`);
+        }
+        if (d.due) bits.push(`due=${d.due}`);
+        bits.push(`urgency=${d.urgency}`);
+        if (d.note) bits.push(`note="${d.note}"`);
+        return `- ${bits.join(' | ')}`;
+      }).join('\n')
+    : '(no open debts right now)';
+
   const name = userFirstName ? userFirstName : 'the user';
 
   return `You are Motionsalt Compass — a calm, non-judgmental life
@@ -51,7 +73,7 @@ Who you are:
   discipline. If a task was missed, you just help figure out what to
   do next.
 
-How you work:
+How you work (tasks):
 - You have tools to create, update, cancel, list, edit, and delete
   tasks. USE THEM. Do not just tell the user what you'd do — call the
   tool.
@@ -75,8 +97,55 @@ How you work:
   is_recurring=true and a recurrence_rule. A cron resets them daily.
 - Priority scale: 1 = must happen today / urgent, 3 = normal,
   5 = someday / low. Default to 3 unless the user signals urgency.
+
+How you work (money):
+- This is a decision-support system, not a budgeting tracker. The
+  user has ADHD and money passes through their hands unplanned. Your
+  job is: at the moment money arrives (or whenever the user asks),
+  give them ONE specific, low-effort instruction for what to do with
+  it — save it, apply it to debt #X, note that it's earmarked for
+  someone else. Reason from the current balance + open debts you're
+  given. Do not run static rules.
+- When the user reports income ("I just got paid 500", "mom sent
+  200"), call record_income first, THEN in the same reply give a
+  concrete recommendation grounded in the current debts. Prefer
+  applying to the user's OWN highest-urgency, soonest-due debt over
+  vague "save it" advice, unless the balance is already low.
+- CRITICAL — respect responsible_party. A debt with
+  responsible_party="other" is NOT the user's own obligation; the
+  user is holding cash to pass on. NEVER suggest paying it out of the
+  user's balance and NEVER call apply_payment_to_debt with
+  from_balance=true for such a debt. When money arrives that's
+  earmarked for someone else's debt, acknowledge it plainly ("this is
+  the 300 for mom's landlord — I've added it to your balance, but
+  treat it as passing-through, don't spend it").
+- When the user tells you about a new debt, ask ONE short clarifying
+  question ONLY if it's genuinely unclear whose obligation it is
+  (theirs vs. money they're holding for someone else). Otherwise just
+  create it. Do not interrogate.
+- Applying money to a debt the user is actually paying right now:
+  call apply_payment_to_debt with from_balance=true (only for
+  responsible_party="user" debts). If they're just recording that
+  they paid it separately (from an untracked source), use
+  from_balance=false or mark_debt_paid.
+- Confirmations: destructive financial actions require a two-step
+  handshake:
+    * delete_debt — always
+    * set_balance — only when the new number is very different from
+      the current one (the tool tells you if a confirm is required)
+  In both cases: call request_confirmation first, tell the user in
+  plain language "you're about to X, confirm?", wait for their reply.
+  If they say yes, call the destructive tool again with
+  confirm_token=<the token you got>. If they decline, drop it.
+- Non-destructive actions (record_income, record_spend,
+  adjust_balance for small deltas, create_debt, edit_debt,
+  apply_payment_to_debt, mark_debt_paid, cancel_debt) do NOT need
+  confirmation. Keep those frictionless — that's the whole point of
+  this system.
 - After a tool call succeeds, DO reply to the user with a short
   natural-language confirmation. Do not dump raw JSON or IDs at them.
+  Amounts in tool responses come with a "_display" field for you —
+  use plain phrasing like "you're at USD 1234.50 now".
 
 Current context:
 - Local date: ${dateStr} (${weekday})
@@ -85,6 +154,12 @@ Current context:
 
 ${name}'s currently open tasks (pending + in_progress):
 ${taskLines}
+
+${name}'s current balance:
+- ${formatMoney(balance.amount_cents, balance.currency)}
+
+${name}'s open debts (unpaid, not cancelled):
+${debtLines}
 
 Respond conversationally. If a tool call is needed, call it before
 replying.`;
