@@ -234,7 +234,8 @@ npx wrangler d1 execute motionsalt_compass --remote \
    should land as `responsible_party = "other"` and Compass should
    NOT suggest paying it from your balance.
 7. Try the direct-read commands (no Gemini call, no quota burn):
-   `/today`, `/balance`, `/debts`, `/finance`, `/setbalance 1234.50`.
+   `/today`, `/balance`, `/debts`, `/finance`, `/setbalance 1234.50`,
+   `/timezone Africa/Lagos`.
 8. Check the D1 console:
 
    ```sql
@@ -379,3 +380,10 @@ so high-frequency reads and simple edits don't burn API quota:
 - `/setbalance <amount> [currency]` — overwrite the balance directly.
   If you typed the command yourself, Compass assumes you meant it and
   skips the AI's large-overwrite confirmation gate.
+- `/timezone <IANA tz name>` — set your own timezone directly (e.g.
+  `/timezone America/New_York`, `/timezone Africa/Lagos`). Used for
+  daily rollovers and any "today" logic. Rejects anything that isn't
+  a real IANA identifier; falls back to the Worker's
+  `DEFAULT_TIMEZONE` for users who've never set one. `/tz` works as
+  a shorthand. Sending `/timezone` with no argument shows the
+  current value.
