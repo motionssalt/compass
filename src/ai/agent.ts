@@ -94,7 +94,8 @@ export async function runAgent(env: Env, input: AgentInput): Promise<string> {
     }
 
     if (toolCalls.length === 0) {
-      finalText = textChunk.trim() || "OK.";
+      finalText = textChunk.trim() ||
+        "Sorry, I lost my train of thought there — try rephrasing or send that again?";
       break;
     }
 
