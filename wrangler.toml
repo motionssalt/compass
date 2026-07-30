@@ -1,0 +1,36 @@
+# Cloudflare Worker configuration for Motionsalt Compass.
+#
+# After you create the D1 database (see README), paste its ID into
+# `database_id` below. Everything else can stay as-is unless you want
+# to rename things.
+
+name = "motionsalt-compass"
+main = "src/index.ts"
+compatibility_date = "2025-07-01"
+compatibility_flags = ["nodejs_compat"]
+
+# Non-secret runtime config. Put SECRET values (TELEGRAM_BOT_TOKEN, the
+# webhook secret, etc.) in the Cloudflare dashboard as encrypted
+# secrets, NOT here.
+[vars]
+# Timezone used for daily rollovers of recurring tasks and API-key
+# quota resets. Cron triggers still run in UTC; this only affects the
+# "which day is it right now" logic.
+DEFAULT_TIMEZONE = "UTC"
+# Gemini model used for reasoning + audio understanding.
+GEMINI_MODEL = "gemini-2.5-flash"
+# Max recent conversation messages fed back into the model.
+CONVERSATION_HISTORY_LIMIT = "20"
+
+# D1 binding. After running `wrangler d1 create motionsalt_compass`,
+# copy the printed database_id here.
+[[d1_databases]]
+binding = "DB"
+database_name = "motionsalt_compass"
+database_id = "REPLACE_WITH_YOUR_D1_DATABASE_ID"
+migrations_dir = "migrations"
+
+# Daily reset at 00:05 UTC: resets recurring tasks to pending and
+# refills API-key quotas.
+[triggers]
+crons = ["5 0 * * *"]
