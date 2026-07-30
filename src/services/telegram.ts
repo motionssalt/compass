@@ -1,29 +1,103 @@
 // Thin Telegram Bot API wrapper — only the calls we actually use.
 
 import type { Env } from '../types/env';
-import type { TelegramFile } from '../types/telegram';
+import type { TelegramFile, InlineKeyboardMarkup } from '../types/telegram';
 import type { BotCommand } from '../handlers/commandMenu';
 
 function apiUrl(token: string, method: string): string {
   return `https://api.telegram.org/bot${token}/${method}`;
 }
 
+/**
+ * Send a plain text message. If `replyMarkup` is provided (inline
+ * keyboard), it's attached to the FIRST chunk only — a keyboard
+ * belongs on the terminal message of a conversation turn, not on
+ * every 4000-char slice. Returns the Telegram message_id of the
+ * first chunk on success (useful when the caller wants to
+ * editMessageText the same message later), or null when the send
+ * fails softly.
+ */
 export async function sendMessage(
   env: Env, chatId: number, text: string,
-): Promise<void> {
+  opts?: { replyMarkup?: InlineKeyboardMarkup },
+): Promise<number | null> {
   // Telegram caps messages at 4096 chars. Chunk if we ever exceed.
   const chunks = chunkText(text, 4000);
-  for (const chunk of chunks) {
+  let firstMsgId: number | null = null;
+  for (let i = 0; i < chunks.length; i++) {
+    const body: Record<string, unknown> = { chat_id: chatId, text: chunks[i] };
+    if (i === 0 && opts?.replyMarkup) body.reply_markup = opts.replyMarkup;
     const resp = await fetch(apiUrl(env.TELEGRAM_BOT_TOKEN, 'sendMessage'), {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ chat_id: chatId, text: chunk }),
+      body: JSON.stringify(body),
     });
     if (!resp.ok) {
-      const body = await resp.text().catch(() => '');
-      throw new Error(`sendMessage failed: ${resp.status} ${body}`);
+      const errBody = await resp.text().catch(() => '');
+      throw new Error(`sendMessage failed: ${resp.status} ${errBody}`);
+    }
+    if (i === 0) {
+      try {
+        const json = await resp.json() as { ok: boolean; result?: { message_id?: number } };
+        if (json.ok && json.result?.message_id) firstMsgId = json.result.message_id;
+      } catch { /* ignore parse failure — send still succeeded */ }
     }
   }
+  return firstMsgId;
+}
+
+/**
+ * Edit an already-sent message's text (and optionally its inline
+ * keyboard). Used to step a menu / flow prompt through its stages
+ * in-place instead of spamming the chat with a new message per tap.
+ *
+ * Errors are swallowed and reported via the return value so the
+ * caller can fall back to sendMessage. Telegram rejects an edit that
+ * results in identical content ("message is not modified") — that's
+ * treated as success here since the visible state is what we wanted.
+ */
+export async function editMessageText(
+  env: Env, chatId: number, messageId: number, text: string,
+  opts?: { replyMarkup?: InlineKeyboardMarkup },
+): Promise<boolean> {
+  const body: Record<string, unknown> = {
+    chat_id: chatId,
+    message_id: messageId,
+    text,
+  };
+  if (opts?.replyMarkup) body.reply_markup = opts.replyMarkup;
+  const resp = await fetch(apiUrl(env.TELEGRAM_BOT_TOKEN, 'editMessageText'), {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify(body),
+  });
+  if (resp.ok) return true;
+  // "message is not modified" surfaces as 400 — treat as no-op success.
+  const errBody = await resp.text().catch(() => '');
+  if (/message is not modified/i.test(errBody)) return true;
+  return false;
+}
+
+/**
+ * Acknowledge a callback_query so the button's loading spinner on
+ * the client stops. MUST be called for every callback update, even
+ * on error — otherwise the tap looks stuck to the user.
+ *
+ * `text`, when provided, appears as a small toast; keep it short
+ * (Telegram caps ~200 chars). Errors are swallowed — this is a
+ * best-effort call.
+ */
+export async function answerCallbackQuery(
+  env: Env, callbackQueryId: string, text?: string, showAlert?: boolean,
+): Promise<void> {
+  const body: Record<string, unknown> = { callback_query_id: callbackQueryId };
+  if (text) body.text = text.slice(0, 200);
+  if (showAlert) body.show_alert = true;
+  await fetch(apiUrl(env.TELEGRAM_BOT_TOKEN, 'answerCallbackQuery'), {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify(body),
+  }).catch(() => { /* non-fatal */ });
 }
 
 export async function sendChatAction(
