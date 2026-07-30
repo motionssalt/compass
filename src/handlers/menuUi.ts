@@ -93,9 +93,11 @@ export const ROOT_MENU_TEXT =
 export function tasksMenuKeyboard(): InlineKeyboardMarkup {
   return keyboard([
     [btn('📅 Today',         cb('tasks', 'today'))],
+    [btn('🗂️ All tasks',    cb('tasks', 'all'))],
     [btn('🔀 Flexible (by priority)', cb('tasks', 'flex'))],
     [btn('➕ Add task',      cb('tasks', 'add'))],
     [btn('✏️ Edit task',     cb('tasks', 'editpick'))],
+    [btn('🗑️ Delete task',   cb('tasks', 'delpick'))],
     [btn('« Back',           cb('nav',   'root'))],
   ]);
 }
@@ -127,8 +129,9 @@ export const FINANCE_MENU_TEXT = `Finance — pick one:`;
 
 export function settingsMenuKeyboard(): InlineKeyboardMarkup {
   return keyboard([
-    [btn('🕒 Timezone', cb('set', 'tz'))],
-    [btn('« Back',      cb('nav', 'root'))],
+    [btn('🕒 Timezone',     cb('set', 'tz'))],
+    [btn('⚠️ Reset all data', cb('set', 'reset'))],
+    [btn('« Back',          cb('nav', 'root'))],
   ]);
 }
 
@@ -234,7 +237,7 @@ export function confirmCreateKeyboard(): InlineKeyboardMarkup {
 
 export function taskPickerKeyboard(
   tasks: { id: number; title: string; priority: number }[],
-  purpose: 'edit',
+  purpose: 'edit' | 'delete',
 ): InlineKeyboardMarkup {
   const rows: InlineKeyboardButton[][] = [];
   for (const t of tasks.slice(0, 12)) {
@@ -353,6 +356,42 @@ export function overwriteConfirmKeyboard(token: string): InlineKeyboardMarkup {
     [
       btn('✅ Confirm overwrite', cb('fin', 'setok', token)),
       btn('✖️ Cancel',            cb('flow', 'cancel')),
+    ],
+  ]);
+}
+
+// ---------------------------------------------------------------
+// Confirm-delete-task keyboard (Tasks → Delete task)
+// ---------------------------------------------------------------
+//
+// Second-stage gate for the button-driven /deletetask flow. The
+// callback carries a pending_confirmations token — the same shape
+// used for overwrite_balance and delete_debt — so the confirm side
+// can't be replayed and can't outlive the 15-minute TTL.
+
+export function deleteTaskConfirmKeyboard(token: string): InlineKeyboardMarkup {
+  return keyboard([
+    [
+      btn('✅ Confirm delete', cb('tasks', 'delok', token)),
+      btn('✖️ Cancel',        cb('flow', 'cancel')),
+    ],
+  ]);
+}
+
+// ---------------------------------------------------------------
+// Confirm-reset-all keyboard (Settings → Reset all data)
+// ---------------------------------------------------------------
+//
+// Same pending_confirmations token pattern. The action is by far
+// the most destructive one the bot exposes — keep the two-button
+// layout so "Confirm" is never a slip-of-the-thumb from the
+// previous screen.
+
+export function resetConfirmKeyboard(token: string): InlineKeyboardMarkup {
+  return keyboard([
+    [
+      btn('✅ Yes, wipe everything', cb('set', 'resetok', token)),
+      btn('✖️ Cancel',              cb('flow', 'cancel')),
     ],
   ]);
 }
