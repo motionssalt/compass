@@ -23,6 +23,20 @@ export async function listOpenTasks(db: D1Database, userId: number): Promise<Tas
   return results ?? [];
 }
 
+/**
+ * All open (pending/in_progress) tasks regardless of scheduled date.
+ *
+ * This is deliberately a thin wrapper around the same base query
+ * listOpenTasks uses — the /alltasks command and its menu button
+ * want "every open task" (today + non-today combined), not a forked
+ * ordering rule. Recurring tasks appear ONCE here (as the single
+ * ongoing row they are); we do NOT expand them into future
+ * occurrences.
+ */
+export async function listAllOpenTasks(db: D1Database, userId: number): Promise<Task[]> {
+  return listOpenTasks(db, userId);
+}
+
 export async function listTasksByFilter(
   db: D1Database,
   userId: number,
