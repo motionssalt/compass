@@ -21,6 +21,7 @@ import { runAgent } from '../ai/agent';
 import { arrayBufferToBase64 } from '../utils/base64';
 import {
   cmdAddTask, cmdAddBatch, cmdEditTask, cmdReviewFlexible,
+  cmdPauseTask, cmdResumeTask, cmdStartTask, cmdFinishTask,
 } from './directTasks';
 import {
   processCallbackQuery, openMenu, tryHandleFlowText,
@@ -182,6 +183,10 @@ async function handleSlashCommand(env: Env, msg: TelegramMessage): Promise<boole
         `/addbatch — add several tasks at once, one per line (also /batch)\n` +
         `/edittask <id> [| field=value ...] — edit a task by id (also /edit)\n` +
         `/deletetask [id] — delete a task by id (asks to confirm; also /del)\n` +
+        `/starttask <id> — mark a task as active right now (also /begin)\n` +
+        `/finishtask <id> — mark a task as done yourself (also /done)\n` +
+        `/pause <id> — pause a task: still visible, but skipped by free-time nudges and "what's active now"\n` +
+        `/resume <id> — unpause a task, back into the nudge pool\n` +
         `/review — list your flexible (unscheduled) tasks, highest priority first (also /flex)\n\n` +
         `Finance:\n` +
         `/balance — current balance\n` +
@@ -215,11 +220,12 @@ async function handleSlashCommand(env: Env, msg: TelegramMessage): Promise<boole
         return true;
       }
       const lines = tasks.map((t) => {
-        const prefix = t.status === 'in_progress' ? '▶' : '•';
+        const prefix = taskStatusPrefix(t.status);
         const bits = [`${prefix} #${t.id} ${t.title}`];
         if (t.priority && t.priority !== DEFAULT_PRIORITY_INT) {
           bits.push(`(${priorityIntToLetter(t.priority)})`);
         }
+        if (t.status === 'paused') bits.push('[paused]');
         if (t.scheduled_for) bits.push(`— ${t.scheduled_for}`);
         return bits.join(' ');
       });
@@ -240,17 +246,44 @@ async function handleSlashCommand(env: Env, msg: TelegramMessage): Promise<boole
         return true;
       }
       const lines = tasks.map((t) => {
-        const prefix = t.status === 'in_progress' ? '▶' : '•';
+        const prefix = taskStatusPrefix(t.status);
         const bits = [`${prefix} #${t.id} ${t.title}`];
         if (t.priority && t.priority !== DEFAULT_PRIORITY_INT) {
           bits.push(`(${priorityIntToLetter(t.priority)})`);
         }
+        if (t.status === 'paused') bits.push('[paused]');
         if (t.is_recurring) bits.push('[recurring]');
         if (t.scheduled_for) bits.push(`— ${t.scheduled_for}`);
         return bits.join(' ');
       });
       await sendMessage(env, msg.chat.id,
         `All open tasks (${tasks.length}):\n${lines.join('\n')}`);
+      return true;
+    }
+
+    case '/pause': {
+      const reply = await cmdPauseTask(env, userId, argStr);
+      await sendMessage(env, msg.chat.id, reply);
+      return true;
+    }
+
+    case '/resume': {
+      const reply = await cmdResumeTask(env, userId, argStr);
+      await sendMessage(env, msg.chat.id, reply);
+      return true;
+    }
+
+    case '/starttask':
+    case '/begin': {
+      const reply = await cmdStartTask(env, userId, argStr);
+      await sendMessage(env, msg.chat.id, reply);
+      return true;
+    }
+
+    case '/finishtask':
+    case '/done': {
+      const reply = await cmdFinishTask(env, userId, argStr);
+      await sendMessage(env, msg.chat.id, reply);
       return true;
     }
 
@@ -456,4 +489,15 @@ async function safeSendError(env: Env, chatId: number): Promise<void> {
   await sendMessage(env, chatId,
     "Something jammed on my end. Give me a moment and try again.",
   );
+}
+
+/**
+ * Prefix glyph for a task line in /today and /alltasks. Kept in one
+ * place so the button-driven listings (handlers/buttons.ts) and the
+ * slash-command listings agree on how each status looks.
+ */
+function taskStatusPrefix(status: string): string {
+  if (status === 'in_progress') return '▶';
+  if (status === 'paused') return '⏸';
+  return '•';
 }
