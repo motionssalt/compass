@@ -414,6 +414,37 @@ webhook at the tunnel URL.
   two-step confirm handshake, whether they originate from the AI or
   from the /menu Set balance flow.
 
+### Knowing what time it is
+
+Compass is told the real current time on every single turn, so it never
+has to guess at the clock or ask you what day it is.
+
+- **Injected, not looked up.** The exact local date, weekday and
+  `HH:MM` ride along inside the same per-turn context block that
+  already carries your open tasks, balance and debts
+  (`src/ai/systemPrompt.ts`) — there is deliberately no
+  `get_current_time` tool the model could forget to call. It has the
+  reading before it starts reasoning.
+- **In your timezone.** The reading is taken in your own IANA zone,
+  with the correct UTC offset for that instant, so DST and half-hour
+  zones (`Asia/Kolkata`, `Australia/Adelaide`) come out right. The
+  model also gets a machine-readable `2026-07-31T22:42+03:00`
+  timestamp to anchor relative phrasing — "in two hours", "tonight",
+  "tomorrow at 9" all resolve against it, which is what lets a vague
+  request become a concretely-scheduled task the nudger can reason
+  about.
+- **One instant per turn.** The timestamp is stamped once when your
+  message arrives and reused everywhere in that turn, so the date and
+  the clock can never disagree across a midnight boundary.
+- **Honest when it's guessing.** If you've never set a timezone,
+  Compass is told the zone is the Worker's `DEFAULT_TIMEZONE` standing
+  in rather than your real one, and will say so once (and point you at
+  `/timezone`) instead of confidently reporting the wrong hour.
+- **Verifiable.** `/time` shows you exactly the reading Compass is
+  working from, without spending any Gemini quota — so if an answer
+  looks time-confused, you can tell straight away whether the clock or
+  the model was at fault.
+
 ### Free-time nudging
 
 A separate, higher-frequency cron scans each user's day. When you're
@@ -423,6 +454,11 @@ single flexible task that best fits the window — by priority and by
 whether its time estimate is smaller than the window — and sends one
 low-key suggestion. One nudge per free window; no double-tapping the
 same window.
+
+Window length is measured against your own wall clock: a task
+scheduled for a bare `19:00` means 19:00 *where you are*, not 19:00
+UTC, so the runway Compass thinks you have matches the runway you
+actually have.
 
 ### Two ways to drive it: talk, or type / tap
 
@@ -479,12 +515,18 @@ and never burn Gemini quota.
 
 ### Settings
 
+- `/time` — the current date, weekday and time in your timezone,
+  exactly as Compass sees it each turn, plus the zone and its UTC
+  offset. Warns you when the zone is only the server default. `/now`
+  is an alias.
 - `/timezone <IANA tz>` — set your own timezone, e.g.
   `/timezone America/New_York`, `/timezone Africa/Lagos`. Used for
   daily rollovers and any "today" logic. Rejects anything that isn't
   a real IANA identifier; falls back to the Worker's
   `DEFAULT_TIMEZONE` for users who've never set one. `/tz` is an alias.
-  Sending `/timezone` with no argument shows the current value.
+  Sending `/timezone` with no argument shows the current value — and
+  the resulting wall-clock time, so a wrong zone is obvious at a
+  glance. Setting a new one echoes the same check.
 
 ### Meta
 
@@ -531,7 +573,9 @@ pushed via the one-shot `/admin/register-commands` endpoint from step 5c.
   - ➡️ Move to set-aside / ⬅️ Take from set-aside
   - 💱 Default currency — pick from common codes or type your own
 - **⚙️ Settings**
-  - 🕒 Timezone — pick from common IANA zones or type your own
+  - 🕒 Timezone — pick from common IANA zones or type your own. The
+    picker shows your current zone *and* what time that makes it for
+    you right now, so a mis-picked zone is caught immediately.
 
 Every button-driven action routes through the same D1 helpers the
 typed commands and AI tools use — no forked logic. Anywhere the menu
@@ -590,7 +634,9 @@ motionsalt-compass/
 │   │   ├── priority.ts           # letter-grade scale
 │   │   ├── freeWindow.ts         # free-window detector
 │   │   ├── nudgeScoring.ts       # flexible-task scorer for the nudger
-│   │   └── time.ts
+│   │   └── time.ts               # local date / wall clock / UTC offset;
+│   │                             #   localNow() is the per-turn reading
+│   │                             #   handed to the AI and to /time
 │   └── types/
 │       ├── env.ts
 │       ├── task.ts
