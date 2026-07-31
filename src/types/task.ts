@@ -1,6 +1,15 @@
 import type { RecurrenceRule } from './shared';
 
-export type TaskStatus = 'pending' | 'in_progress' | 'done' | 'cancelled';
+// 'paused' is the new "parked for now" state introduced alongside the
+// /pause and /resume slash commands, the Pause / Resume menu buttons,
+// and the AI's pause_task / resume_task tools. A paused task is still
+// on the user's list — visible in every listing, every picker, every
+// review — but is excluded from the free-time nudger and is not
+// counted as the user's "active" task. See utils/nudgeScoring.ts and
+// utils/freeWindow.ts for the two-and-a-half places where status is
+// inspected by exact value, and src/db/tasks.ts for the listing query
+// that decides which statuses count as "open".
+export type TaskStatus = 'pending' | 'in_progress' | 'paused' | 'done' | 'cancelled';
 
 export interface Task {
   id: number;
