@@ -22,6 +22,8 @@
 
 import type { InlineKeyboardButton, InlineKeyboardMarkup } from '../types/telegram';
 import { PRIORITY_LETTERS } from '../utils/priority';
+import type { SchedulingConstraint, WeekdayCode } from '../types/shared';
+import { WEEKDAY_CODES } from '../types/shared';
 
 export const CB_VERSION = '1';
 
@@ -261,11 +263,12 @@ export function taskPickerKeyboard(
 /** Which field of the picked task to edit. */
 export function editFieldKeyboard(taskId: number): InlineKeyboardMarkup {
   return keyboard([
-    [btn('Title',    cb('flow', 'efield', String(taskId), 'title'))],
-    [btn('Priority', cb('flow', 'efield', String(taskId), 'prio'))],
-    [btn('Duration', cb('flow', 'efield', String(taskId), 'dur'))],
-    [btn('When',     cb('flow', 'efield', String(taskId), 'when'))],
-    [btn('Status',   cb('flow', 'efield', String(taskId), 'status'))],
+    [btn('Title',      cb('flow', 'efield', String(taskId), 'title'))],
+    [btn('Priority',   cb('flow', 'efield', String(taskId), 'prio'))],
+    [btn('Duration',   cb('flow', 'efield', String(taskId), 'dur'))],
+    [btn('When',       cb('flow', 'efield', String(taskId), 'when'))],
+    [btn('Constraint', cb('flow', 'efield', String(taskId), 'constraint'))],
+    [btn('Status',     cb('flow', 'efield', String(taskId), 'status'))],
     [btn('✖️ Cancel', cb('flow', 'cancel'))],
   ]);
 }
@@ -281,6 +284,106 @@ export function statusPickerKeyboard(taskId: number): InlineKeyboardMarkup {
     [btn('✖️ Cancel', cb('flow', 'cancel'))],
   ]);
 }
+
+// ---------------------------------------------------------------
+// Scheduling-constraint sub-pickers (edit-task "Constraint" field)
+// ---------------------------------------------------------------
+//
+// Constraint is a compound field with three independent sub-parts —
+// a date range, a days-of-week set, and a daily time-of-day window.
+// Since the values are free-form (arbitrary YYYY-MM-DD dates, HH:MM
+// times) and would blow past the 64-byte callback_data budget if
+// fully encoded, we mix modes:
+//   - Date range and time window prompt for free text and reuse the
+//     same parseConstraintExpression parser the /schedule command and
+//     the `constraint=` tag use. No forked syntax.
+//   - Days-of-week is a toggle grid — 7 buttons, one per weekday, tap
+//     to flip, then a Save button commits.
+//   - A Clear button drops the whole constraint (stores null).
+// The parent "parts" keyboard is what users see first; each row jumps
+// to one of the sub-pickers.
+
+/**
+ * Constraint sub-menu: pick which part to edit, clear the whole
+ * thing, or back out. Shown after the user picks "Constraint" from
+ * the edit-field picker.
+ */
+export function constraintPartsKeyboard(taskId: number): InlineKeyboardMarkup {
+  return keyboard([
+    [btn('📅 Date range',    cb('flow', 'ecdates', String(taskId)))],
+    [btn('🗓 Days of week',  cb('flow', 'ecdays',  String(taskId)))],
+    [btn('⏰ Time window',   cb('flow', 'ectime',  String(taskId)))],
+    [btn('🧹 Clear constraint', cb('flow', 'ecclr', String(taskId)))],
+    [btn('✅ Done',   cb('flow', 'econdone', String(taskId)))],
+    [btn('✖️ Cancel', cb('flow', 'cancel'))],
+  ]);
+}
+
+/**
+ * Days-of-week toggle keyboard. Selected days are marked with a
+ * leading ✓ so the button label mirrors the current state without
+ * an extra status line above the keyboard.
+ */
+export function constraintDaysKeyboard(
+  taskId: number, selected: readonly WeekdayCode[],
+): InlineKeyboardMarkup {
+  const set = new Set(selected);
+  const label = (d: WeekdayCode) => (set.has(d) ? `✓ ${d}` : d);
+  // Two rows of days for a compact grid (4 + 3), then Save/Back/Cancel.
+  const row1: WeekdayCode[] = ['mon', 'tue', 'wed', 'thu'];
+  const row2: WeekdayCode[] = ['fri', 'sat', 'sun'];
+  return keyboard([
+    row1.map((d) => btn(label(d), cb('flow', 'edow', String(taskId), d))),
+    row2.map((d) => btn(label(d), cb('flow', 'edow', String(taskId), d))),
+    [btn('✅ Save days', cb('flow', 'edowok', String(taskId)))],
+    [btn('« Back',       cb('flow', 'econback', String(taskId)))],
+    [btn('✖️ Cancel',    cb('flow', 'cancel'))],
+  ]);
+}
+
+/**
+ * Cancel-only keyboard for the free-text prompts (date range, time
+ * window). Same shape as the internal cancelOnlyKeyboard in
+ * buttons.ts, but with an extra "« Back" to the parts sub-menu so
+ * users can bail on one sub-part without cancelling the whole edit.
+ */
+export function constraintTextPromptKeyboard(taskId: number): InlineKeyboardMarkup {
+  return keyboard([
+    [btn('« Back',    cb('flow', 'econback', String(taskId)))],
+    [btn('✖️ Cancel', cb('flow', 'cancel'))],
+  ]);
+}
+
+/**
+ * Multi-line, human-readable rendering of a constraint for the parts
+ * sub-menu header. Says "none" plainly when the field is null so the
+ * screen is self-explanatory. Kept here (rather than reusing
+ * directTasks.ts#formatConstraint) so menuUi has no dependency on a
+ * command handler.
+ */
+export function describeConstraintForMenu(c: SchedulingConstraint | null): string {
+  if (!c) return 'none';
+  const parts: string[] = [];
+  if (c.date_range) {
+    const { start, end } = c.date_range;
+    if (start && end) parts.push(`dates ${start}→${end}`);
+    else if (start) parts.push(`from ${start}`);
+    else if (end) parts.push(`until ${end}`);
+  }
+  if (c.days_of_week && c.days_of_week.length > 0) {
+    parts.push(`days ${c.days_of_week.join(',')}`);
+  }
+  if (c.time_of_day) {
+    parts.push(`time ${c.time_of_day.start}–${c.time_of_day.end}`);
+  }
+  return parts.length > 0 ? parts.join('; ') : 'none';
+}
+
+// Re-export the weekday-code list so buttons.ts can iterate it
+// without importing from types directly — keeps menuUi as the single
+// place that owns the day-picker's ordering.
+export { WEEKDAY_CODES };
+export type { WeekdayCode };
 
 // ---------------------------------------------------------------
 // Timezone picker (Settings → Timezone)
