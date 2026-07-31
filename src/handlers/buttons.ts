@@ -25,7 +25,10 @@ import {
   editMessageText,
   sendMessage,
 } from '../services/telegram';
-import { upsertUser, getUserTimezone, setUserTimezone, isValidIanaTimezone, setUserDefaultCurrency } from '../db/users';
+import {
+  upsertUser, getUserTimezone, resolveUserTimezone, setUserTimezone,
+  isValidIanaTimezone, setUserDefaultCurrency,
+} from '../db/users';
 import {
   listTasksByFilter, listOpenTasks, listAllOpenTasks,
   createTask, editTask, deleteTask, getTaskById, updateTaskStatus,
@@ -44,6 +47,7 @@ import {
 import { parseAmountToCents, formatMoney, formatCents } from '../utils/money';
 import { priorityIntToLetter, DEFAULT_PRIORITY_INT, isValidPriorityLetter } from '../utils/priority';
 import { isFlexibleTask } from '../utils/nudgeScoring';
+import { localNow } from '../utils/time';
 import { comparePriorityInt } from '../utils/priority';
 import {
   decodeCb,
@@ -485,9 +489,16 @@ async function handleSettings(
   const userId = cq.from.id;
 
   if (action === 'tz') {
-    const current = await getUserTimezone(env.DB, userId, env.DEFAULT_TIMEZONE);
+    // Show the resulting wall clock next to the identifier: the zone
+    // name alone doesn't tell the user whether it's the right one, a
+    // wrong time does. Same reasoning as the /timezone command.
+    const { timezone: current, isExplicit } =
+      await resolveUserTimezone(env.DB, userId, env.DEFAULT_TIMEZONE);
+    const clock = localNow(new Date(), current);
     await editOrSend(env, msg,
-      `Timezone — pick one (current: ${current}):`,
+      `Timezone — pick one.\n\n`
+      + `Current: ${current}${isExplicit ? '' : ' (server default — not set by you)'}\n`
+      + `That makes it ${clock.clock} on ${clock.weekdayLong} for you right now.`,
       timezoneKeyboard(),
     );
     return;
