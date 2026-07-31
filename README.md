@@ -1,11 +1,12 @@
 # Motionsalt Compass
 
 A calm, conversational life organizer that lives inside Telegram. You
-talk to it in text or voice; it manages your open tasks, recurring
-habits, letter-graded priorities, task time estimates, your running
-balance, a "set-aside" money bucket for cash you've earmarked but not
-spent, and the debts you owe (or are just holding cash for on someone
-else's behalf) — all behind the scenes.
+talk to it in text or voice; it manages your open tasks (pending,
+in-progress, or paused), recurring habits, letter-graded priorities,
+task time estimates, your running balance, a "set-aside" money bucket
+for cash you've earmarked but not spent, and the debts you owe (or
+are just holding cash for on someone else's behalf) — all behind the
+scenes.
 
 The finance side is deliberately a decision-support tool, not an
 expense tracker. When money arrives, Compass looks at your current
@@ -436,7 +437,10 @@ and never burn Gemini quota.
 
 ### Tasks
 
-- `/today` — today's tasks.
+- `/today` — today's tasks (includes paused tasks so you can still see
+  them on the list, prefixed with ⏸).
+- `/alltasks` — every open task, today + non-today combined. `/all`
+  is an alias.
 - `/addtask <title> [| p=A] [| dur=45] [| when=tonight] [| note=...]` —
   add a single task. `/add` is an alias.
 - `/addbatch` — add several tasks at once, one task per line, same
@@ -444,7 +448,21 @@ and never burn Gemini quota.
   stripped, `#` starts a comment). `/batch` is an alias.
 - `/edittask <id> [| field=value | ...]` — edit an existing task. Fields:
   `title`, `priority` (A+..E-), `dur` (minutes), `when`, `note`,
-  `status` (`pending|in_progress|done|cancelled`). `/edit` is an alias.
+  `status` (`pending|in_progress|paused|done|cancelled`). `/edit` is an
+  alias.
+- `/deletetask [id]` — delete a task by id (asks to confirm via the
+  same pending_confirmations gate the AI uses). Without an id, opens
+  the same picker the menu Delete Task button uses. `/del` is an alias.
+- `/starttask <id>` — mark a task as active right now
+  (status=`in_progress`). `/begin` is an alias.
+- `/finishtask <id>` — mark a task as done yourself. `/done` is an
+  alias.
+- `/pause <id>` — park a task without dropping it. A paused task
+  stays visible in every listing (today / all / review / menu pickers),
+  but is skipped by the free-time nudger and is NOT counted as
+  "what's active now". Use `/resume <id>` to unpause.
+- `/resume <id>` — unpause a task; it goes back to `pending` and is
+  eligible for free-time nudges again.
 - `/review` — list your flexible (unscheduled) open tasks, highest
   priority first. `/flex` and `/flexible` are aliases.
 
@@ -487,12 +505,24 @@ pushed via the one-shot `/admin/register-commands` endpoint from step 5c.
 `/menu` (or `/settings`) opens an inline-keyboard menu:
 
 - **📋 Tasks**
-  - 📅 Today — today's tasks
+  - 📅 Today — today's tasks (paused tasks visible here, prefixed ⏸)
+  - 🗂️ All tasks — every open task, today + non-today combined (also
+    via `/alltasks`)
   - 🔀 Flexible (by priority) — same list as `/review`
   - ➕ Add task — step-by-step wizard: title → priority band (A..E) →
     fine-tune (`+`, plain, `-`) → rough duration → confirm
   - ✏️ Edit task — pick from a list of open tasks, then pick the field
-    to edit (Title, Priority, Duration, When, Status)
+    to edit (Title, Priority, Duration, When, Status). The Status
+    picker now includes **Paused** alongside Pending / In progress /
+    Done / Cancelled.
+  - ▶️ Start · ✅ Finish — one-tap direct status changes: pick a task,
+    it goes to `in_progress` or `done`. Same helper the AI, `/starttask`,
+    and `/finishtask` use.
+  - ⏸️ Pause · ▶️ Resume — one-tap park and unpark. The Pause picker
+    only lists pausable tasks (pending or in-progress); the Resume
+    picker only lists paused tasks. Same helper the AI, `/pause`, and
+    `/resume` use.
+  - 🗑️ Delete task — pick from a list, then confirm.
 - **💰 Finance**
   - 💵 View balance (shows set-aside too when non-zero)
   - 📒 View debts
