@@ -47,6 +47,29 @@ export async function getUserTimezone(
 }
 
 /**
+ * Same lookup as getUserTimezone, but also reports WHERE the zone
+ * came from.
+ *
+ * The distinction matters wherever we state the current time as
+ * fact: a zone the user picked is their real local time, whereas the
+ * Worker's DEFAULT_TIMEZONE is a stand-in that may be hours off. The
+ * system prompt (ai/systemPrompt.ts) and /time both surface this so
+ * Compass can say "this is my best guess at your zone — set it with
+ * /timezone" instead of confidently reporting the wrong hour.
+ */
+export async function resolveUserTimezone(
+  db: D1Database, userId: number, fallback: string,
+): Promise<{ timezone: string; isExplicit: boolean }> {
+  const row = await db.prepare(
+    `SELECT timezone FROM users WHERE user_id = ?1`,
+  ).bind(userId).first<{ timezone: string | null }>();
+  const stored = row?.timezone || null;
+  return stored
+    ? { timezone: stored, isExplicit: true }
+    : { timezone: fallback, isExplicit: false };
+}
+
+/**
  * Validate that `tz` is a real IANA timezone identifier the runtime
  * recognises. We rely on `Intl.DateTimeFormat` throwing a RangeError
  * for unknown zones — Cloudflare Workers ship the full ICU tz
