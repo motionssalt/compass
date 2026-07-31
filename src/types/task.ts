@@ -37,6 +37,24 @@ export interface Task {
    * shown so the user isn't shown the same one over and over.
    */
   last_nudged_at: string | null;
+  /**
+   * Structured scheduling-constraint JSON (see SchedulingConstraint
+   * in ../types/shared.ts). Null when the task has no such
+   * constraint — which is the default. Parse/validate/evaluate via
+   * src/utils/scheduleConstraint.ts; no other module should touch
+   * the raw string.
+   */
+  schedule_constraint: string | null;
+  /**
+   * Opaque cycle key stamped when the nudge cron observes that a
+   * recurring task's constraint window has closed for the current
+   * cycle with the task still open. Null means "no missed cycle
+   * pending". Cleared on completion or when a fresh cycle opens.
+   * Purely a nudge-eligibility signal — the daily reset in
+   * src/db/tasks.resetRecurringForDay ignores it, so a missed cycle
+   * NEVER affects the following occurrence.
+   */
+  missed_cycle_key: string | null;
   created_at: string;
   updated_at: string;
 }
