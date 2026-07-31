@@ -7,6 +7,7 @@ import {
   createTask, updateTaskStatus, cancelTask, listTasksByFilter,
   editTask, deleteTask,
 } from '../db/tasks';
+import type { TaskStatus } from '../types/task';
 import {
   getUserTimezone, setUserDefaultCurrency, getUserDefaultCurrency,
 } from '../db/users';
@@ -43,6 +44,8 @@ export async function executeTool(
       // ---- tasks ----
       case 'create_task':        return await handleCreate(env, userId, call.args);
       case 'update_task_status': return await handleUpdateStatus(env, userId, call.args);
+      case 'pause_task':         return await handlePauseTask(env, userId, call.args);
+      case 'resume_task':        return await handleResumeTask(env, userId, call.args);
       case 'cancel_task':        return await handleCancel(env, userId, call.args);
       case 'list_tasks':         return await handleList(env, userId, call.args);
       case 'edit_task':          return await handleEdit(env, userId, call.args);
@@ -162,14 +165,35 @@ async function handleCreate(env: Env, userId: number, args: Record<string, unkno
 
 async function handleUpdateStatus(env: Env, userId: number, args: Record<string, unknown>): Promise<ToolResult> {
   const id = Number(args.task_id);
-  const status = String(args.status ?? '') as any;
+  const status = String(args.status ?? '') as TaskStatus;
   if (!id) return { name: 'update_task_status', response: { ok: false, error: 'task_id required' } };
-  if (!['pending', 'in_progress', 'done', 'cancelled'].includes(status)) {
+  if (!['pending', 'in_progress', 'paused', 'done', 'cancelled'].includes(status)) {
     return { name: 'update_task_status', response: { ok: false, error: `invalid status: ${status}` } };
   }
   const task = await updateTaskStatus(env.DB, userId, id, status);
   if (!task) return { name: 'update_task_status', response: { ok: false, error: 'task not found' } };
   return { name: 'update_task_status', response: { ok: true, task: decorateTask(task) } };
+}
+
+// pause_task / resume_task are thin convenience wrappers around
+// update_task_status — same underlying updateTaskStatus helper the
+// /pause and /resume slash-commands and the Pause / Resume buttons
+// route through. No forked logic; the AI just gets clearer verbs.
+
+async function handlePauseTask(env: Env, userId: number, args: Record<string, unknown>): Promise<ToolResult> {
+  const id = Number(args.task_id);
+  if (!id) return { name: 'pause_task', response: { ok: false, error: 'task_id required' } };
+  const task = await updateTaskStatus(env.DB, userId, id, 'paused');
+  if (!task) return { name: 'pause_task', response: { ok: false, error: 'task not found' } };
+  return { name: 'pause_task', response: { ok: true, task: decorateTask(task) } };
+}
+
+async function handleResumeTask(env: Env, userId: number, args: Record<string, unknown>): Promise<ToolResult> {
+  const id = Number(args.task_id);
+  if (!id) return { name: 'resume_task', response: { ok: false, error: 'task_id required' } };
+  const task = await updateTaskStatus(env.DB, userId, id, 'pending');
+  if (!task) return { name: 'resume_task', response: { ok: false, error: 'task not found' } };
+  return { name: 'resume_task', response: { ok: true, task: decorateTask(task) } };
 }
 
 async function handleCancel(env: Env, userId: number, args: Record<string, unknown>): Promise<ToolResult> {
