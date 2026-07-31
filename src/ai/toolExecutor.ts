@@ -1,11 +1,12 @@
 // Bridges Gemini function calls to actual D1 operations.
 
 import type { Env } from '../types/env';
-import type { RecurrenceRule } from '../types/shared';
+import type { RecurrenceRule, SchedulingConstraint } from '../types/shared';
 import type { ResponsibleParty } from '../types/finance';
 import {
   createTask, updateTaskStatus, cancelTask, listTasksByFilter,
   editTask, deleteTask,
+  parseScheduleConstraint, safeParseStoredConstraint,
 } from '../db/tasks';
 import type { TaskStatus } from '../types/task';
 import {
@@ -86,14 +87,18 @@ export async function executeTool(
 /**
  * When we return a task to Gemini we swap the stored priority
  * integer for the letter grade the AI actually speaks. The raw
- * integer is not exposed.
+ * integer is not exposed. schedule_constraint is inflated from the
+ * stored JSON string to a real object so the model doesn't have to
+ * parse it — same treatment recurrence_rule already gets in the
+ * system-prompt task lines.
  */
 function decorateTask(t: any) {
   if (!t) return t;
-  const { priority, ...rest } = t;
+  const { priority, schedule_constraint, ...rest } = t;
   return {
     ...rest,
     priority: priorityIntToLetter(priority),
+    schedule_constraint: safeParseStoredConstraint(schedule_constraint),
   };
 }
 
@@ -150,6 +155,14 @@ async function handleCreate(env: Env, userId: number, args: Record<string, unkno
       },
     };
   }
+  // schedule_constraint: absent -> null (no constraint), otherwise
+  // validated up front so a bad shape becomes a clean tool error
+  // instead of a thrown D1 write halfway through.
+  const constraint = parseConstraintArg(args.schedule_constraint);
+  if (!constraint.ok) {
+    return { name: 'create_task', response: { ok: false, error: constraint.error } };
+  }
+
   const task = await createTask(env.DB, {
     user_id: userId,
     title,
@@ -159,6 +172,7 @@ async function handleCreate(env: Env, userId: number, args: Record<string, unkno
     is_recurring: !!args.is_recurring,
     recurrence_rule: rule ?? null,
     time_estimate_minutes: parseTimeEstimateArg(args.time_estimate_minutes),
+    schedule_constraint: constraint.value,
   });
   return { name: 'create_task', response: { ok: true, task: decorateTask(task) } };
 }
@@ -231,6 +245,18 @@ async function handleEdit(env: Env, userId: number, args: Record<string, unknown
     };
   }
 
+  // schedule_constraint: distinguish "leave alone" (key absent from
+  // the fields object) from "clear it" (explicit null). Any other
+  // value goes through the same validator the create path uses.
+  let constraintPatch: SchedulingConstraint | null | undefined;
+  if ('schedule_constraint' in fields) {
+    const parsed = parseConstraintArg(fields.schedule_constraint);
+    if (!parsed.ok) {
+      return { name: 'edit_task', response: { ok: false, error: parsed.error } };
+    }
+    constraintPatch = parsed.value;
+  }
+
   const task = await editTask(env.DB, userId, id, {
     title: fields.title as string | undefined,
     priority: fields.priority as string | number | undefined,
@@ -240,6 +266,7 @@ async function handleEdit(env: Env, userId: number, args: Record<string, unknown
     recurrence_rule: fields.recurrence_rule as RecurrenceRule | null | undefined,
     status: fields.status as any,
     time_estimate_minutes: parseTimeEstimateArg(fields.time_estimate_minutes),
+    schedule_constraint: constraintPatch,
   });
   if (!task) return { name: 'edit_task', response: { ok: false, error: 'task not found' } };
   return { name: 'edit_task', response: { ok: true, task: decorateTask(task) } };
@@ -265,6 +292,27 @@ function parseTimeEstimateArg(v: unknown): number | null | undefined {
   if (!Number.isFinite(n)) return undefined;
   if (n <= 0) return null;
   return Math.round(n);
+}
+
+/**
+ * Validate the schedule_constraint tool argument against the same
+ * parser db/tasks (and the direct-command path) use, so an invalid
+ * shape becomes a clean tool-response error rather than a D1 write
+ * throw. Missing (undefined) becomes null — the tool contract is
+ * that either you send a constraint or you don't; there is no
+ * "leave unchanged" for create, and edit distinguishes leave-alone
+ * from clear at the CALL site (see handleEdit) before it gets here.
+ */
+function parseConstraintArg(
+  v: unknown,
+): { ok: true; value: SchedulingConstraint | null } | { ok: false; error: string } {
+  if (v === undefined || v === null) return { ok: true, value: null };
+  if (typeof v !== 'object' || Array.isArray(v)) {
+    return { ok: false, error: 'schedule_constraint must be an object' };
+  }
+  const res = parseScheduleConstraint(v as Record<string, unknown>);
+  if (!res.ok) return { ok: false, error: res.error };
+  return { ok: true, value: res.constraint };
 }
 
 // ---------------------------------------------------------------
