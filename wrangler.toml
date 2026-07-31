@@ -18,7 +18,7 @@ compatibility_flags = ["nodejs_compat"]
 # "which day is it right now" logic.
 DEFAULT_TIMEZONE = "UTC"
 # Gemini model used for reasoning + audio understanding.
-GEMINI_MODEL = "gemini-2.5-flash"
+GEMINI_MODEL = "gemini-3.1-flash-lite"
 # Max recent conversation messages fed back into the model.
 CONVERSATION_HISTORY_LIMIT = "20"
 
