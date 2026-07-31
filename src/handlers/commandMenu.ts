@@ -16,8 +16,8 @@
 //     [a-z0-9_] only.
 //   - `description` must be 3-256 chars.
 // Aliases (e.g. /add vs /addtask, /tz vs /timezone, /settings vs
-// /menu, /begin vs /starttask, /done vs /finishtask) are omitted on
-// purpose: Telegram's menu should show one canonical entry per
+// /menu, /begin vs /starttask, /done vs /finishtask, /now vs /time)
+// are omitted on purpose: Telegram's menu should show one canonical entry per
 // action, not both. The aliases keep working — they're just not
 // advertised in the menu.
 
@@ -45,6 +45,7 @@ export const BOT_COMMANDS: readonly BotCommand[] = [
   { command: 'resume',     description: 'Resume a paused task' },
   { command: 'review',     description: 'Review flexible / unscheduled tasks (also /flex)' },
   { command: 'setbalance', description: 'Overwrite the balance directly' },
+  { command: 'time',       description: 'Show the current date and time in your timezone (also /now)' },
   { command: 'timezone',   description: 'Set your IANA timezone (also /tz)' },
   { command: 'reset',      description: 'Wipe all your data and start fresh (asks to confirm)' },
 ];
