@@ -7,7 +7,7 @@ import { buildSystemPrompt } from './systemPrompt';
 import { generate, type GeminiContent, type GeminiPart } from './gemini';
 import { executeTool, type ToolCall } from './toolExecutor';
 import { listOpenTasks } from '../db/tasks';
-import { getUserTimezone, getUserDefaultCurrency } from '../db/users';
+import { resolveUserTimezone, getUserDefaultCurrency } from '../db/users';
 import { getBalance } from '../db/balance';
 import { listOpenDebts } from '../db/debts';
 import { recentMessages, appendMessage, pruneOld } from '../db/conversation';
@@ -24,7 +24,13 @@ export interface AgentInput {
 }
 
 export async function runAgent(env: Env, input: AgentInput): Promise<string> {
-  const tz = await getUserTimezone(env.DB, input.userId, env.DEFAULT_TIMEZONE);
+  // Stamp the turn once, up front. Everything time-related in this
+  // turn is derived from this single instant, so the clock reading the
+  // model sees can't drift across the DB round-trips below or
+  // disagree with itself over a midnight boundary.
+  const now = new Date();
+  const { timezone: tz, isExplicit: tzIsExplicit } =
+    await resolveUserTimezone(env.DB, input.userId, env.DEFAULT_TIMEZONE);
   const [openTasks, balance, openDebts, defaultCurrency] = await Promise.all([
     listOpenTasks(env.DB, input.userId),
     getBalance(env.DB, input.userId),
@@ -34,6 +40,8 @@ export async function runAgent(env: Env, input: AgentInput): Promise<string> {
   const systemInstruction = buildSystemPrompt({
     userFirstName: input.firstName,
     timezone: tz,
+    timezoneIsExplicit: tzIsExplicit,
+    now,
     openTasks,
     balance,
     openDebts,
