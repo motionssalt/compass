@@ -1,8 +1,31 @@
 import type { Task } from '../types/task';
 import type { BalanceRow, DebtRow } from '../types/finance';
+import type { SchedulingConstraint } from '../types/shared';
 import { formatMoney } from '../utils/money';
 import { priorityIntToLetter } from '../utils/priority';
 import { localNow } from '../utils/time';
+import { safeParseStoredConstraint } from '../utils/scheduleConstraint';
+
+/**
+ * Compact, human-readable rendering of a stored SchedulingConstraint
+ * for the per-task line the AI sees each turn. Independent of any
+ * recurrence_rule the task already carries — the AI is separately
+ * told (in the tool descriptions) that constraints layer on top.
+ * Returns null when there is nothing to say.
+ */
+function summariseConstraint(c: SchedulingConstraint | null): string | null {
+  if (!c) return null;
+  const parts: string[] = [];
+  if (c.date_range) {
+    const { start, end } = c.date_range;
+    if (start && end) parts.push(`${start}→${end}`);
+    else if (start) parts.push(`from ${start}`);
+    else if (end) parts.push(`until ${end}`);
+  }
+  if (c.time_of_day) parts.push(`${c.time_of_day.start}–${c.time_of_day.end}`);
+  if (c.days_of_week && c.days_of_week.length > 0) parts.push(c.days_of_week.join('/'));
+  return parts.length > 0 ? parts.join(' ') : null;
+}
 
 /**
  * Build the system prompt that establishes Compass's voice AND injects
@@ -60,6 +83,10 @@ export function buildSystemPrompt(params: {
           bits.push(`recurring${rule}`);
         }
         if (t.scheduled_for) bits.push(`scheduled=${t.scheduled_for}`);
+        const windowSummary = summariseConstraint(
+          safeParseStoredConstraint(t.schedule_constraint),
+        );
+        if (windowSummary) bits.push(`window=${windowSummary}`);
         if (t.context_note) bits.push(`note="${t.context_note}"`);
         return `- ${bits.join(' | ')}`;
       }).join('\n')
