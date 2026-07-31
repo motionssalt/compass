@@ -59,7 +59,7 @@ export async function generate(
     generationConfig: {
       temperature: 0.7,
       topP: 0.95,
-      // Raised from 1024: on gemini-2.5-flash, "thinking" tokens are
+      // Raised from 1024: on gemini-3.1-flash-lite, "thinking" tokens are
       // deducted from this same budget. At 1024 the model would
       // sometimes burn the whole budget thinking and hit MAX_TOKENS
       // before writing any visible text, causing the "OK." fallback.
