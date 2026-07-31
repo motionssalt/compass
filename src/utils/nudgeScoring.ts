@@ -16,6 +16,16 @@
 //      items surface).
 //   4. Fairness penalty for tasks nudged recently.
 //
+// Eligibility gate:
+//   Before scoring, a task must be `constraint-satisfied at now` — a
+//   task with a scheduling constraint (see ../types/shared and
+//   ./scheduleConstraint) is only considered when the current instant
+//   falls inside its window (in the user's timezone). Tasks with no
+//   constraint sail through this check unchanged. This is the ONE
+//   place the nudger observes the constraint; the free-window
+//   calculator deliberately doesn't know about it (a task not
+//   currently in its window is not "constraining the window" either).
+//
 // This module is pure — no D1, no network. It gets a snapshot of
 // tasks + the current time, returns a decision.
 
@@ -26,6 +36,10 @@ import {
   DEFAULT_PRIORITY_INT,
   MAX_PRIORITY_INT,
 } from './priority';
+import {
+  isConstraintSatisfied,
+  safeParseStoredConstraint,
+} from './scheduleConstraint';
 
 /** Tasks whose duration exceeds the window by more than this are unfit. */
 const OVERRUN_TOLERANCE_MINUTES = 5;
@@ -46,6 +60,21 @@ export function isFlexibleTask(t: Task): boolean {
   const s = t.scheduled_for.trim();
   if (/^\d{4}-\d{2}-\d{2}/.test(s)) return false;
   return true;
+}
+
+/**
+ * Is this task currently ELIGIBLE for a nudge with respect to its
+ * scheduling constraint? A task with no constraint always is; a
+ * task with one is only eligible while `now` sits inside its window
+ * in the user's timezone. A corrupt constraint blob is treated as
+ * no constraint (see safeParseStoredConstraint) — a garbled DB
+ * value must not silently mute a task.
+ */
+export function isConstraintEligibleNow(
+  t: Task, now: Date, timezone: string,
+): boolean {
+  const c = safeParseStoredConstraint(t.schedule_constraint);
+  return isConstraintSatisfied(c, now, timezone);
 }
 
 export interface ScoredTask {
@@ -127,15 +156,22 @@ export function scoreTaskForWindow(
  * Pick the single best flexible task to nudge about, or null when
  * nothing suitable is open. Ties on score break by lower priority
  * integer (more important first), then by lower id (older first).
+ *
+ * `timezone` is required for the scheduling-constraint eligibility
+ * gate: a task whose constraint says "only weekday mornings" must
+ * be evaluated against the user's wall clock, not UTC.
  */
 export function pickNudgeTask(
   openTasks: Task[],
   window: FreeWindow,
   now: Date,
+  timezone: string,
 ): ScoredTask | null {
   if (window.isBusy || window.minutesAvailable === null) return null;
 
-  const flexible = openTasks.filter(isFlexibleTask);
+  const flexible = openTasks
+    .filter(isFlexibleTask)
+    .filter((t) => isConstraintEligibleNow(t, now, timezone));
   if (flexible.length === 0) return null;
 
   const scored = flexible
