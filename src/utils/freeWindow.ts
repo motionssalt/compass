@@ -14,6 +14,7 @@
 // conservative default cap.
 
 import type { Task } from '../types/task';
+import { localDateParts, utcOffsetMinutes } from './time';
 
 /**
  * Conservative upper bound on how long a "free window" can be
@@ -52,7 +53,7 @@ export interface FreeWindow {
 function scheduledMinutesFromNow(
   scheduled: string | null | undefined,
   now: Date,
-  _timezone: string,
+  timezone: string,
 ): number | null {
   if (!scheduled) return null;
   const trimmed = scheduled.trim();
@@ -66,18 +67,29 @@ function scheduledMinutesFromNow(
     return Math.round(diff / 60000);
   }
 
-  // Bare HH:MM — interpret as "today at that clock in UTC-ish".
-  // Timezone-perfect handling would need proper zone math; the
-  // existing time helpers don't expose an offset calculation, so we
-  // deliberately keep this rough. Overshoot rolls to tomorrow.
+  // Bare HH:MM — "today at that clock in the USER'S zone".
+  //
+  // This used to be pinned to UTC (setUTCHours) because the time
+  // helpers exposed no offset calculation, which made every window
+  // wrong by the user's offset — a 19:00 task read as 19:00Z, i.e.
+  // 22:00 for a UTC+3 user, so the nudger thought there were three
+  // more free hours than there really were. utils/time.utcOffsetMinutes
+  // now gives us the real offset, so we do it properly.
+  //
+  // We use the offset in effect right now rather than at the target
+  // instant: across a DST boundary later today that can be off by an
+  // hour, which is well inside the tolerance of a "you have ~90min
+  // free" nudge. Overshoot still rolls to tomorrow.
   const hhmm = /^(\d{1,2}):(\d{2})$/.exec(trimmed);
   if (hhmm) {
     const hour = parseInt(hhmm[1], 10);
     const min = parseInt(hhmm[2], 10);
     if (hour > 23 || min > 59) return null;
-    const target = new Date(now);
-    target.setUTCHours(hour, min, 0, 0);
-    let diff = target.getTime() - now.getTime();
+    const { year, month, day } = localDateParts(now, timezone);
+    const offsetMinutes = utcOffsetMinutes(now, timezone);
+    // Local wall clock -> real instant: subtract the zone's offset.
+    const target = Date.UTC(year, month - 1, day, hour, min) - offsetMinutes * 60000;
+    let diff = target - now.getTime();
     if (diff <= 0) diff += 24 * 3600 * 1000;
     return Math.round(diff / 60000);
   }
@@ -101,7 +113,8 @@ function taskConstrainsWindow(t: Task, now: Date, tz: string): number | null {
  *
  * @param openTasks pending + in_progress rows for the user
  * @param now       the reference "now" (parameterised for testability)
- * @param timezone  IANA zone; only used for HH:MM parsing today
+ * @param timezone  IANA zone; used to resolve bare HH:MM scheduled
+ *                  times against the user's real wall clock
  */
 export function computeFreeWindow(
   openTasks: Task[],
