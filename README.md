@@ -386,6 +386,12 @@ webhook at the tunnel URL.
   scheduled time is treated as an appointment. Anything else is
   flexible and shows up in `/review` (a.k.a. `/flex`), ordered by
   priority.
+- **Scheduling constraints.** On top of `scheduled_for`, any task can
+  carry an optional *constraint* saying when it's eligible at all
+  — an inclusive date range, a set of weekdays, a daily time-of-day
+  window, or any combination. Each sub-part is independent, and
+  independent of any recurrence rule. See the dedicated section
+  below.
 - **Status.** `pending → in_progress → done` (or `cancelled`).
   Compass sets it in conversation ("I'm done with the groceries") or
   you can flip it via the /menu Edit Task flow, `/edittask <id> | status=done`.
@@ -413,6 +419,97 @@ webhook at the tunnel URL.
   debt; overwrite the balance to a very different number) require a
   two-step confirm handshake, whether they originate from the AI or
   from the /menu Set balance flow.
+
+---
+
+## Scheduling constraints
+
+Every task can carry an optional **scheduling constraint** on top of
+its `scheduled_for` field. Where `scheduled_for` says *"this happens
+at 19:00 on Friday"*, a constraint says *"this task is only eligible
+at all inside this window"* — morning workouts (`time:06:00-08:00`),
+a project you only want to touch weekdays (`days:mon,tue,wed,thu,fri`),
+a single-month push (`dates:2026-08-01..2026-08-31`), or any
+combination. The free-time nudger honours it: a task whose constraint
+isn't currently satisfied is skipped for the current window without
+being dropped from your list.
+
+The field has three independent sub-parts, and every write path
+(AI tools, `/schedule`, `/edittask | constraint=`, the /menu Edit
+Task → Constraint picker) funnels through the same validator, so the
+shape is the same everywhere:
+
+- **`dates:YYYY-MM-DD..YYYY-MM-DD`** — inclusive date range in your
+  timezone. Either side may be `-` or omitted for an open-ended range
+  (`dates:2026-08-01..` = "from August 1st onwards";
+  `dates:..2026-08-15` = "until the 15th").
+- **`days:mon,wed,fri`** — comma-separated lowercase 3-letter
+  weekday codes. Any non-empty subset of `mon,tue,wed,thu,fri,sat,sun`.
+- **`time:HH:MM-HH:MM`** — daily wall-clock window in your timezone,
+  inclusive at the start and exclusive at the end. Wraparound is OK
+  (`time:22:00-02:00` means "22:00 today through 02:00 tomorrow").
+
+Any subset of the three is legal, and an absent sub-part imposes no
+restriction. A task with no constraint at all is always eligible —
+the default state for every task written before this feature landed.
+
+### Mini-syntax
+
+Inside `/schedule` and inside the `constraint=` tag on `/addtask` /
+`/edittask`, sub-parts are separated by `;` or `|`. Whitespace is
+tolerated everywhere and sub-keys are case-insensitive:
+
+```
+days:mon,wed,fri; time:07:00-08:00
+dates:2026-08-01..2026-08-15; days:mon,tue,wed,thu,fri
+time:22:00-02:00
+```
+
+### `/schedule` command
+
+```
+/schedule 12 days:mon,wed,fri; time:07:00-08:00
+/schedule 12 dates:2026-08-01..2026-08-15
+/schedule 12 clear      # remove the whole constraint
+/schedule 12            # show the current one
+```
+
+`/constraint` is an alias for the exact same command. Editing routes
+through the same `editTask` helper the AI's `edit_task` tool, the
+`/edittask` command, and the /menu Edit Task flow all call — no
+forked write path.
+
+### `constraint=` tag on /addtask and /edittask
+
+```
+/addtask Morning stretch | constraint=days:mon,tue,wed,thu,fri; time:06:00-06:30
+/edittask 12 | constraint=dates:2026-08-01..2026-08-31
+/edittask 12 | constraint=      # bare = with no value clears it
+```
+
+`window=` and `c=` are shorter aliases for the `constraint=` key.
+
+### Button path (/menu → Tasks → Edit task → Constraint)
+
+For users who'd rather not type the mini-syntax, `/menu → Tasks →
+Edit task →` pick the task `→ Constraint` opens a small sub-menu
+with one button per sub-part:
+
+- **📅 Date range** — prompts for a free-text value in the same
+  `YYYY-MM-DD..YYYY-MM-DD` syntax (with `-` and open-ended forms
+  supported). Sending `-` clears just the date range.
+- **🗓 Days of week** — opens a 7-day toggle grid seeded with the
+  current selection; tap each day to flip it and tap ✅ Save when
+  done. Saving an empty selection clears just the days.
+- **⏰ Time window** — prompts for a free-text `HH:MM-HH:MM`. Sending
+  `-` clears just the time window.
+- **🧹 Clear constraint** — one-tap wipe of the whole field
+  (equivalent to `/schedule <id> clear`).
+
+Each sub-part commits on its own and lands you back on the parts
+menu with a refreshed header showing the new state, so you can tweak
+one piece at a time without walking the whole flow. Tap ✅ Done to
+close.
 
 ### Knowing what time it is
 
@@ -484,8 +581,14 @@ and never burn Gemini quota.
   stripped, `#` starts a comment). `/batch` is an alias.
 - `/edittask <id> [| field=value | ...]` — edit an existing task. Fields:
   `title`, `priority` (A+..E-), `dur` (minutes), `when`, `note`,
-  `status` (`pending|in_progress|paused|done|cancelled`). `/edit` is an
-  alias.
+  `status` (`pending|in_progress|paused|done|cancelled`),
+  `constraint` (see `/schedule` below — same mini-syntax; `window=`
+  and `c=` are shorter aliases; a bare `constraint=` with no value
+  clears the field). `/edit` is an alias.
+- `/schedule <id> [dates:YYYY-MM-DD..YYYY-MM-DD] [days:mon,wed,fri] [time:HH:MM-HH:MM]` —
+  set a scheduling window on a task. `/schedule <id> clear` removes
+  it; bare `/schedule <id>` shows the current one. Sub-keys are
+  independent — any subset is legal. `/constraint` is an alias.
 - `/deletetask [id]` — delete a task by id (asks to confirm via the
   same pending_confirmations gate the AI uses). Without an id, opens
   the same picker the menu Delete Task button uses. `/del` is an alias.
@@ -554,9 +657,13 @@ pushed via the one-shot `/admin/register-commands` endpoint from step 5c.
   - ➕ Add task — step-by-step wizard: title → priority band (A..E) →
     fine-tune (`+`, plain, `-`) → rough duration → confirm
   - ✏️ Edit task — pick from a list of open tasks, then pick the field
-    to edit (Title, Priority, Duration, When, Status). The Status
-    picker now includes **Paused** alongside Pending / In progress /
-    Done / Cancelled.
+    to edit (Title, Priority, Duration, When, **Constraint**, Status).
+    The Status picker includes **Paused** alongside Pending /
+    In progress / Done / Cancelled. The Constraint picker is a small
+    sub-menu of its own (see the Scheduling constraints section)
+    that lets you edit the three sub-parts independently: a date
+    range, a days-of-week set (as a tap-to-toggle grid), and a daily
+    time-of-day window — plus a one-tap Clear.
   - ▶️ Start · ✅ Finish — one-tap direct status changes: pick a task,
     it goes to `in_progress` or `done`. Same helper the AI, `/starttask`,
     and `/finishtask` use.
