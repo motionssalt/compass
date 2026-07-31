@@ -16,10 +16,10 @@
 //     [a-z0-9_] only.
 //   - `description` must be 3-256 chars.
 // Aliases (e.g. /add vs /addtask, /tz vs /timezone, /settings vs
-// /menu, /begin vs /starttask, /done vs /finishtask, /now vs /time)
-// are omitted on purpose: Telegram's menu should show one canonical entry per
-// action, not both. The aliases keep working — they're just not
-// advertised in the menu.
+// /menu, /begin vs /starttask, /done vs /finishtask, /now vs /time,
+// /constraint vs /schedule) are omitted on purpose: Telegram's menu
+// should show one canonical entry per action, not both. The aliases
+// keep working — they're just not advertised in the menu.
 
 export interface BotCommand {
   command: string;      // without leading slash
@@ -38,6 +38,7 @@ export const BOT_COMMANDS: readonly BotCommand[] = [
   { command: 'addtask',    description: 'Add a single task (also /add)' },
   { command: 'addbatch',   description: 'Add several tasks at once (also /batch)' },
   { command: 'edittask',   description: 'Edit an existing task by id (also /edit)' },
+  { command: 'schedule',   description: 'Set a scheduling window on a task (also /constraint)' },
   { command: 'deletetask', description: 'Delete a task by id, with confirm (also /del)' },
   { command: 'starttask',  description: 'Mark a task active right now (also /begin)' },
   { command: 'finishtask', description: 'Mark a task done yourself (also /done)' },
