@@ -61,7 +61,13 @@ import {
   timezoneKeyboard, TZ_SLOTS,
   currencyKeyboard, CURRENCY_SLOTS,
   overwriteConfirmKeyboard, deleteTaskConfirmKeyboard, resetConfirmKeyboard,
+  constraintPartsKeyboard, constraintDaysKeyboard,
+  constraintTextPromptKeyboard, describeConstraintForMenu,
+  WEEKDAY_CODES, type WeekdayCode,
 } from './menuUi';
+import { parseConstraintExpression } from './directTasks';
+import { safeParseStoredConstraint } from '../utils/scheduleConstraint';
+import type { SchedulingConstraint } from '../types/shared';
 import { log } from '../utils/logger';
 
 // ---------------------------------------------------------------
@@ -761,7 +767,170 @@ async function handleFlow(
         statusPickerKeyboard(id));
       return;
     }
+    if (field === 'constraint') {
+      // Enter the constraint sub-menu. State-wise we sit on
+      // `await_constraint_part` — the user's next tap picks which
+      // sub-part they want (or clears / done). All follow-up steps
+      // reuse this flow, so we stash the task id in state and stay
+      // inside `edit_task`.
+      await startFlow<EditTaskState>(env.DB, userId, 'edit_task', 'await_constraint_part',
+        { task_id: id }, msg.chat.id, msg.message_id);
+      const current = safeParseStoredConstraint(existing.schedule_constraint);
+      await editOrSend(env, msg,
+        `Constraint for #${id}: ${describeConstraintForMenu(current)}\n\n`
+        + `Pick a part to change. Each part is independent — setting one leaves the others alone.`,
+        constraintPartsKeyboard(id));
+      return;
+    }
     return 'unknown field';
+  }
+
+  // Constraint sub-menu — pick a part to edit.
+  if (action === 'ecdates') {
+    const id = parseInt(args[0] ?? '', 10);
+    if (!Number.isFinite(id)) return 'bad id';
+    await advanceFlow<EditTaskState>(env.DB, userId, 'await_constraint_dates',
+      { task_id: id }, msg.message_id);
+    await editOrSend(env, msg,
+      `Date range for #${id}?\n\n`
+      + `Send free text in the mini-syntax, e.g.\n`
+      + `  2026-08-01..2026-08-15\n`
+      + `  2026-08-01..     (from that date on)\n`
+      + `  ..2026-08-15     (until that date)\n`
+      + `  -                (clear the date range only)`,
+      constraintTextPromptKeyboard(id));
+    return;
+  }
+
+  if (action === 'ectime') {
+    const id = parseInt(args[0] ?? '', 10);
+    if (!Number.isFinite(id)) return 'bad id';
+    await advanceFlow<EditTaskState>(env.DB, userId, 'await_constraint_time',
+      { task_id: id }, msg.message_id);
+    await editOrSend(env, msg,
+      `Daily time window for #${id}?\n\n`
+      + `Send free text, e.g.\n`
+      + `  07:00-08:00\n`
+      + `  22:00-02:00   (wraparound across midnight is OK)\n`
+      + `  -             (clear the time window only)`,
+      constraintTextPromptKeyboard(id));
+    return;
+  }
+
+  if (action === 'ecdays') {
+    const id = parseInt(args[0] ?? '', 10);
+    if (!Number.isFinite(id)) return 'bad id';
+    const existing = await getTaskById(env.DB, userId, id);
+    if (!existing) {
+      await editOrSend(env, msg, `That task is gone.`, tasksMenuKeyboard());
+      await clearFlow(env.DB, userId);
+      return;
+    }
+    const current = safeParseStoredConstraint(existing.schedule_constraint);
+    // Seed the day-picker with whatever is already stored so users
+    // start from the current selection, not an empty grid.
+    const seed: WeekdayCode[] = (current?.days_of_week ?? []) as WeekdayCode[];
+    await advanceFlow<EditTaskState>(env.DB, userId, 'await_constraint_days',
+      { task_id: id, days: seed }, msg.message_id);
+    await editOrSend(env, msg,
+      `Days of week for #${id}? Tap to toggle. Save when done — an empty selection clears the days-of-week part only.`,
+      constraintDaysKeyboard(id, seed));
+    return;
+  }
+
+  if (action === 'edow') {
+    // Toggle a single day in the in-progress selection.
+    const id = parseInt(args[0] ?? '', 10);
+    const day = args[1];
+    if (!Number.isFinite(id) || !day) return 'bad args';
+    if (!(WEEKDAY_CODES as readonly string[]).includes(day)) return 'bad day';
+    const flow = await getFlow<EditTaskState>(env.DB, userId);
+    if (!flow || flow.flow !== 'edit_task' || flow.step !== 'await_constraint_days') {
+      return 'no constraint flow';
+    }
+    const cur: WeekdayCode[] = (flow.state.days ?? []) as WeekdayCode[];
+    const set = new Set<WeekdayCode>(cur);
+    if (set.has(day as WeekdayCode)) set.delete(day as WeekdayCode);
+    else set.add(day as WeekdayCode);
+    // Store in canonical mon..sun order so the display stays stable.
+    const next = WEEKDAY_CODES.filter((d) => set.has(d));
+    await advanceFlow<EditTaskState>(env.DB, userId, 'await_constraint_days',
+      { days: next }, msg.message_id);
+    await editOrSend(env, msg,
+      `Days of week for #${id}? Tap to toggle. Save when done — an empty selection clears the days-of-week part only.`,
+      constraintDaysKeyboard(id, next));
+    return;
+  }
+
+  if (action === 'edowok') {
+    // Commit the days-of-week selection. Merges into the existing
+    // constraint via the SAME editTask helper every other edit uses.
+    const id = parseInt(args[0] ?? '', 10);
+    if (!Number.isFinite(id)) return 'bad id';
+    const flow = await getFlow<EditTaskState>(env.DB, userId);
+    if (!flow || flow.flow !== 'edit_task') return 'no edit-task flow';
+    const days: WeekdayCode[] = (flow.state.days ?? []) as WeekdayCode[];
+    return await commitConstraintPart(env, cq, id, (c) => {
+      const next: SchedulingConstraint = { ...(c ?? {}) };
+      if (days.length === 0) delete next.days_of_week;
+      else next.days_of_week = [...days];
+      return next;
+    });
+  }
+
+  if (action === 'ecclr') {
+    // Clear the whole constraint. Routes through editTask with
+    // schedule_constraint=null, matching /schedule <id> clear.
+    const id = parseInt(args[0] ?? '', 10);
+    if (!Number.isFinite(id)) return 'bad id';
+    const updated = await editTask(env.DB, userId, id, { schedule_constraint: null });
+    if (!updated) {
+      await editOrSend(env, msg, `No task #${id}.`, tasksMenuKeyboard());
+    } else {
+      await editOrSend(env, msg,
+        `Constraint cleared: ${formatTaskLine(updated)}`,
+        tasksMenuKeyboard());
+    }
+    await clearFlow(env.DB, userId);
+    return 'cleared';
+  }
+
+  if (action === 'econback') {
+    // Return to the parts sub-menu from a sub-picker.
+    const id = parseInt(args[0] ?? '', 10);
+    if (!Number.isFinite(id)) return 'bad id';
+    const existing = await getTaskById(env.DB, userId, id);
+    if (!existing) {
+      await editOrSend(env, msg, `That task is gone.`, tasksMenuKeyboard());
+      await clearFlow(env.DB, userId);
+      return;
+    }
+    await advanceFlow<EditTaskState>(env.DB, userId, 'await_constraint_part',
+      { task_id: id }, msg.message_id);
+    const current = safeParseStoredConstraint(existing.schedule_constraint);
+    await editOrSend(env, msg,
+      `Constraint for #${id}: ${describeConstraintForMenu(current)}\n\n`
+      + `Pick a part to change.`,
+      constraintPartsKeyboard(id));
+    return;
+  }
+
+  if (action === 'econdone') {
+    // Finish the constraint edit — no writes here, all sub-parts have
+    // already committed themselves. Just close the flow and show the
+    // final task state.
+    const id = parseInt(args[0] ?? '', 10);
+    if (!Number.isFinite(id)) return 'bad id';
+    const existing = await getTaskById(env.DB, userId, id);
+    if (existing) {
+      await editOrSend(env, msg,
+        `Done: ${formatTaskLine(existing)}`,
+        tasksMenuKeyboard());
+    } else {
+      await editOrSend(env, msg, `Task gone.`, tasksMenuKeyboard());
+    }
+    await clearFlow(env.DB, userId);
+    return 'done';
   }
 
   // Status pick for edit-task.
@@ -906,6 +1075,63 @@ async function addFlowConfirm(
 interface EditTaskState extends Record<string, unknown> {
   task_id?: number;
   band?: string;
+  /**
+   * In-progress selection while the user is on the days-of-week
+   * toggle grid. Committed to the task on Save (edowok). Kept out
+   * of the task row entirely until then.
+   */
+  days?: WeekdayCode[];
+}
+
+/**
+ * Merge a single sub-part into the task's existing constraint and
+ * write it back via editTask — the SAME helper every other task edit
+ * (AI, /schedule, /edittask, other menu fields) funnels through. The
+ * `mutate` callback receives the current constraint (may be null) and
+ * returns the new one; returning an object with no keys collapses to
+ * null so the storage layer clears the row rather than storing `{}`.
+ */
+async function commitConstraintPart(
+  env: Env,
+  cq: TelegramCallbackQuery,
+  id: number,
+  mutate: (current: SchedulingConstraint | null) => SchedulingConstraint,
+): Promise<string | undefined> {
+  const msg = cq.message!;
+  const userId = cq.from.id;
+  const existing = await getTaskById(env.DB, userId, id);
+  if (!existing) {
+    await editOrSend(env, msg, `That task is gone.`, tasksMenuKeyboard());
+    await clearFlow(env.DB, userId);
+    return;
+  }
+  const current = safeParseStoredConstraint(existing.schedule_constraint);
+  const nextRaw = mutate(current);
+  // If every sub-key is absent, collapse to null so the field is
+  // truly cleared rather than stored as an empty object.
+  const hasAny =
+    (nextRaw.date_range && (nextRaw.date_range.start || nextRaw.date_range.end))
+    || (nextRaw.days_of_week && nextRaw.days_of_week.length > 0)
+    || (nextRaw.time_of_day && nextRaw.time_of_day.start && nextRaw.time_of_day.end);
+  const next: SchedulingConstraint | null = hasAny ? nextRaw : null;
+  const updated = await editTask(env.DB, userId, id, { schedule_constraint: next });
+  if (!updated) {
+    await editOrSend(env, msg, `No task #${id}.`, tasksMenuKeyboard());
+    await clearFlow(env.DB, userId);
+    return;
+  }
+  // Land back on the parts sub-menu so the user can tweak another
+  // part without re-entering the field picker. Refresh the header
+  // with the newly-saved state so what they see matches reality.
+  const refreshed = safeParseStoredConstraint(updated.schedule_constraint);
+  await advanceFlow<EditTaskState>(env.DB, userId, 'await_constraint_part',
+    { task_id: id, days: undefined }, msg.message_id);
+  await editOrSend(env, msg,
+    `Updated: ${formatTaskLine(updated)}\n`
+    + `Constraint: ${describeConstraintForMenu(refreshed)}\n\n`
+    + `Change another part, or tap Done.`,
+    constraintPartsKeyboard(id));
+  return 'saved';
 }
 
 async function editFlowPriorityBand(
@@ -1003,6 +1229,12 @@ export async function tryHandleFlowText(
   if (flow.flow === 'edit_task' && flow.step === 'await_when') {
     return await editTaskAwaitWhen(env, msg, flow as FlowState<EditTaskState>, text);
   }
+  if (flow.flow === 'edit_task' && flow.step === 'await_constraint_dates') {
+    return await editTaskAwaitConstraintDates(env, msg, flow as FlowState<EditTaskState>, text);
+  }
+  if (flow.flow === 'edit_task' && flow.step === 'await_constraint_time') {
+    return await editTaskAwaitConstraintTime(env, msg, flow as FlowState<EditTaskState>, text);
+  }
   if (flow.flow === 'tz_other' && flow.step === 'await_iana') {
     return await tzOtherAwait(env, msg, text);
   }
@@ -1062,6 +1294,137 @@ async function editTaskAwaitTitle(
     await sendMessage(env, msg.chat.id, `Updated: ${formatTaskLine(updated)}`);
   }
   await clearFlow(env.DB, userId);
+  return true;
+}
+
+async function editTaskAwaitConstraintDates(
+  env: Env, msg: TelegramMessage, flow: FlowState<EditTaskState>, text: string,
+): Promise<boolean> {
+  const userId = msg.from!.id;
+  const id = flow.state.task_id;
+  if (!id) {
+    await clearFlow(env.DB, userId);
+    return true;
+  }
+  const trimmed = text.trim();
+  const isClear = trimmed === '-' || trimmed === '' ||
+    /^(clear|none|off)$/i.test(trimmed);
+  // Reuse the SAME parser /schedule and the `constraint=` tag use —
+  // wrap the bare value in a `dates:` prefix so a single sub-part
+  // reuses the whole-expression validator (dates format, ordering).
+  let mutator: ((c: SchedulingConstraint | null) => SchedulingConstraint) | null = null;
+  if (isClear) {
+    mutator = (c) => {
+      const next: SchedulingConstraint = { ...(c ?? {}) };
+      delete next.date_range;
+      return next;
+    };
+  } else {
+    const parsed = parseConstraintExpression(`dates:${trimmed}`);
+    if (!parsed.ok) {
+      await sendMessage(env, msg.chat.id,
+        `Couldn't read that date range: ${parsed.error}\n\nTry e.g. 2026-08-01..2026-08-15, or send "-" to clear.`);
+      return true;
+    }
+    const dr = parsed.value?.date_range;
+    mutator = (c) => {
+      const next: SchedulingConstraint = { ...(c ?? {}) };
+      if (dr && (dr.start || dr.end)) next.date_range = dr;
+      else delete next.date_range;
+      return next;
+    };
+  }
+  const existing = await getTaskById(env.DB, userId, id);
+  if (!existing) {
+    await sendMessage(env, msg.chat.id, `That task is gone.`);
+    await clearFlow(env.DB, userId);
+    return true;
+  }
+  const current = safeParseStoredConstraint(existing.schedule_constraint);
+  const nextRaw = mutator(current);
+  const hasAny =
+    (nextRaw.date_range && (nextRaw.date_range.start || nextRaw.date_range.end))
+    || (nextRaw.days_of_week && nextRaw.days_of_week.length > 0)
+    || (nextRaw.time_of_day && nextRaw.time_of_day.start && nextRaw.time_of_day.end);
+  const next: SchedulingConstraint | null = hasAny ? nextRaw : null;
+  const updated = await editTask(env.DB, userId, id, { schedule_constraint: next });
+  if (!updated) {
+    await sendMessage(env, msg.chat.id, `No task #${id}.`);
+    await clearFlow(env.DB, userId);
+    return true;
+  }
+  const refreshed = safeParseStoredConstraint(updated.schedule_constraint);
+  await advanceFlow<EditTaskState>(env.DB, userId, 'await_constraint_part',
+    { task_id: id }, null);
+  await sendMessage(env, msg.chat.id,
+    `Updated: ${formatTaskLine(updated)}\n`
+    + `Constraint: ${describeConstraintForMenu(refreshed)}\n\n`
+    + `Change another part, or tap Done.`,
+    { replyMarkup: constraintPartsKeyboard(id) });
+  return true;
+}
+
+async function editTaskAwaitConstraintTime(
+  env: Env, msg: TelegramMessage, flow: FlowState<EditTaskState>, text: string,
+): Promise<boolean> {
+  const userId = msg.from!.id;
+  const id = flow.state.task_id;
+  if (!id) {
+    await clearFlow(env.DB, userId);
+    return true;
+  }
+  const trimmed = text.trim();
+  const isClear = trimmed === '-' || trimmed === '' ||
+    /^(clear|none|off)$/i.test(trimmed);
+  let mutator: ((c: SchedulingConstraint | null) => SchedulingConstraint) | null = null;
+  if (isClear) {
+    mutator = (c) => {
+      const next: SchedulingConstraint = { ...(c ?? {}) };
+      delete next.time_of_day;
+      return next;
+    };
+  } else {
+    const parsed = parseConstraintExpression(`time:${trimmed}`);
+    if (!parsed.ok) {
+      await sendMessage(env, msg.chat.id,
+        `Couldn't read that time window: ${parsed.error}\n\nTry e.g. 07:00-08:00, or send "-" to clear.`);
+      return true;
+    }
+    const tw = parsed.value?.time_of_day;
+    mutator = (c) => {
+      const next: SchedulingConstraint = { ...(c ?? {}) };
+      if (tw) next.time_of_day = tw;
+      else delete next.time_of_day;
+      return next;
+    };
+  }
+  const existing = await getTaskById(env.DB, userId, id);
+  if (!existing) {
+    await sendMessage(env, msg.chat.id, `That task is gone.`);
+    await clearFlow(env.DB, userId);
+    return true;
+  }
+  const current = safeParseStoredConstraint(existing.schedule_constraint);
+  const nextRaw = mutator(current);
+  const hasAny =
+    (nextRaw.date_range && (nextRaw.date_range.start || nextRaw.date_range.end))
+    || (nextRaw.days_of_week && nextRaw.days_of_week.length > 0)
+    || (nextRaw.time_of_day && nextRaw.time_of_day.start && nextRaw.time_of_day.end);
+  const next: SchedulingConstraint | null = hasAny ? nextRaw : null;
+  const updated = await editTask(env.DB, userId, id, { schedule_constraint: next });
+  if (!updated) {
+    await sendMessage(env, msg.chat.id, `No task #${id}.`);
+    await clearFlow(env.DB, userId);
+    return true;
+  }
+  const refreshed = safeParseStoredConstraint(updated.schedule_constraint);
+  await advanceFlow<EditTaskState>(env.DB, userId, 'await_constraint_part',
+    { task_id: id }, null);
+  await sendMessage(env, msg.chat.id,
+    `Updated: ${formatTaskLine(updated)}\n`
+    + `Constraint: ${describeConstraintForMenu(refreshed)}\n\n`
+    + `Change another part, or tap Done.`,
+    { replyMarkup: constraintPartsKeyboard(id) });
   return true;
 }
 
