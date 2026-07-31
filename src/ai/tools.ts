@@ -5,6 +5,51 @@
 // C+, C, C-, D+, D, D-, E+, E, E-). See src/utils/priority.ts for
 // the canonical helper — the AI never sees the underlying integer.
 
+// ---------------------------------------------------------------
+// Shared: schedule_constraint schema.
+//
+// The stored shape lives in src/types/shared.ts (SchedulingConstraint)
+// and is parsed/validated by src/utils/scheduleConstraint.ts — this
+// declaration mirrors that shape 1:1 so the AI writes the same JSON
+// the direct-command parser writes. Kept as a const so create_task
+// and edit_task stay identical (and stay in sync automatically).
+//
+// Independent from `scheduled_for` and `recurrence_rule`: a
+// constraint can layer on top of either, or stand alone. Every
+// sub-field is optional; passing an empty / all-null constraint is
+// equivalent to no constraint at all.
+const SCHEDULE_CONSTRAINT_SCHEMA = {
+  type: 'OBJECT',
+  description:
+    'Optional structured scheduling constraint. Any combination of the three sub-fields is legal; all three are independent of each other AND of scheduled_for / recurrence_rule. Applies to one-off and recurring tasks alike. Set this when the user narrows WHEN a task may happen without pinning a single moment — e.g. "any weekday morning before Aug 15", "Mon/Wed/Fri between 07:00 and 08:00", "some time before Friday". Prefer scheduled_for for a single concrete moment; prefer recurrence_rule for the cadence of a repeating habit; use this for windows on top. Omit the field entirely (or pass null) when the user did not narrow anything. Times and dates are in the user\'s timezone.',
+  properties: {
+    date_range: {
+      type: 'OBJECT',
+      description:
+        'Inclusive wall-clock date range. Either side may be omitted (open-ended windows are legal). Dates are "YYYY-MM-DD".',
+      properties: {
+        start: { type: 'STRING', description: 'YYYY-MM-DD, inclusive. Omit for "no lower bound".' },
+        end: { type: 'STRING', description: 'YYYY-MM-DD, inclusive. Omit for "no upper bound".' },
+      },
+    },
+    time_of_day: {
+      type: 'OBJECT',
+      description:
+        'Daily HH:MM..HH:MM window (24-hour). Both ends required when time_of_day is present. Wraparound windows (start > end, e.g. 22:00..02:00) are supported and mean "from start today through end tomorrow". Inclusive at start, exclusive at end.',
+      properties: {
+        start: { type: 'STRING', description: 'HH:MM 24-hour.' },
+        end: { type: 'STRING', description: 'HH:MM 24-hour.' },
+      },
+    },
+    days_of_week: {
+      type: 'ARRAY',
+      items: { type: 'STRING' },
+      description:
+        'Applicable weekdays as lowercase 3-letter codes: mon, tue, wed, thu, fri, sat, sun. Omit or pass all seven for "any day".',
+    },
+  },
+} as const;
+
 export const TOOL_DECLARATIONS = [
   {
     name: 'create_task',
@@ -30,7 +75,7 @@ export const TOOL_DECLARATIONS = [
         scheduled_for: {
           type: 'STRING',
           description:
-            'Optional. ISO datetime OR loose text like "morning", "this week", "tonight". Leave empty if the user did not specify a time.',
+            'Optional. ISO datetime OR loose text like "morning", "this week", "tonight". Leave empty if the user did not specify a time. If the user only narrowed a WINDOW (a date range, a time-of-day window, or specific weekdays), use schedule_constraint instead of stuffing that into this field.',
         },
         is_recurring: {
           type: 'BOOLEAN',
@@ -56,6 +101,7 @@ export const TOOL_DECLARATIONS = [
           description:
             'Optional rough duration in minutes. Set it when the user hints at how long the task takes ("quick 5-min call", "spend an hour on X", "half-day thing"); otherwise leave empty. Whole minutes, positive.',
         },
+        schedule_constraint: SCHEDULE_CONSTRAINT_SCHEMA,
       },
       required: ['title', 'priority'],
     },
@@ -134,14 +180,14 @@ export const TOOL_DECLARATIONS = [
   },
   {
     name: 'edit_task',
-    description: 'Edit fields on an existing task (title, priority letter grade, context, scheduling, recurrence, time estimate).',
+    description: 'Edit fields on an existing task (title, priority letter grade, context, scheduling, recurrence, time estimate, schedule_constraint). Pass schedule_constraint=null to clear a previously-set constraint.',
     parameters: {
       type: 'OBJECT',
       properties: {
         task_id: { type: 'INTEGER' },
         fields: {
           type: 'OBJECT',
-          description: 'Any subset of: title, priority (letter grade A+..E-), context_note, scheduled_for, is_recurring, recurrence_rule, status, time_estimate_minutes.',
+          description: 'Any subset of: title, priority (letter grade A+..E-), context_note, scheduled_for, is_recurring, recurrence_rule, status, time_estimate_minutes, schedule_constraint.',
           properties: {
             title: { type: 'STRING' },
             priority: {
@@ -163,6 +209,7 @@ export const TOOL_DECLARATIONS = [
               type: 'INTEGER',
               description: 'Rough duration in minutes. Positive whole number; pass 0 or negative to clear it.',
             },
+            schedule_constraint: SCHEDULE_CONSTRAINT_SCHEMA,
           },
         },
       },
