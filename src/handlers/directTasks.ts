@@ -25,9 +25,9 @@
 
 import type { Env } from '../types/env';
 import type { RecurrenceRule } from '../types/shared';
-import type { Task } from '../types/task';
+import type { Task, TaskStatus } from '../types/task';
 import {
-  createTask, editTask, getTaskById, listOpenTasks,
+  createTask, editTask, getTaskById, listOpenTasks, updateTaskStatus,
   type CreateTaskInput, type EditFields,
 } from '../db/tasks';
 import { sendMessage } from '../services/telegram';
@@ -125,7 +125,7 @@ export async function cmdEditTask(
   if (!argStr.trim()) {
     return (
       `Usage: /edittask <id> field=value [| field=value ...]\n` +
-      `Fields: title, priority (A+..E-), dur (minutes), when, note, status (pending|in_progress|done|cancelled)\n` +
+      `Fields: title, priority (A+..E-), dur (minutes), when, note, status (pending|in_progress|paused|done|cancelled)\n` +
       `Example: /edittask 12 | p=A- | dur=30 | when=tonight`
     );
   }
@@ -169,6 +169,81 @@ export async function cmdReviewFlexible(
     return `No open flexible tasks. Everything on the list either has a hard time or is already in progress.`;
   }
   return `Flexible tasks (highest priority first):\n${flexible.map(formatTaskLine).join('\n')}`;
+}
+
+// ---------------------------------------------------------------
+// Status-only direct commands.
+//
+// Thin wrappers around updateTaskStatus — same helper the AI's
+// update_task_status / pause_task / resume_task tools, the
+// /edittask status field, the status picker inside Edit Task, and
+// the Start / Finish / Pause / Resume menu buttons all route
+// through. No forked logic.
+//
+//   /pause      -> status='paused'      (parked; hidden from nudges)
+//   /resume     -> status='pending'     (unpark; back into nudges)
+//   /starttask  -> status='in_progress' (user is actively on it now)
+//   /finishtask -> status='done'        (user finished it themselves)
+//
+// All four expect a single argument — the task id — mirroring the
+// existing /deletetask <id> shape.
+// ---------------------------------------------------------------
+
+async function statusOnlyCommand(
+  env: Env, userId: number, argStr: string,
+  targetStatus: TaskStatus,
+  usage: string,
+  formatMsg: (task: Task) => string,
+): Promise<string> {
+  const idStr = argStr.trim().split(/\s+/)[0];
+  const id = parseInt(idStr, 10);
+  if (!idStr || !Number.isFinite(id) || id <= 0) {
+    return usage;
+  }
+  const existing = await getTaskById(env.DB, userId, id);
+  if (!existing) return `No task #${id}.`;
+  if (existing.status === targetStatus) {
+    return `Task #${id} is already ${targetStatus}.`;
+  }
+  const updated = await updateTaskStatus(env.DB, userId, id, targetStatus);
+  if (!updated) return `No task #${id}.`;
+  return formatMsg(updated);
+}
+
+export async function cmdPauseTask(
+  env: Env, userId: number, argStr: string,
+): Promise<string> {
+  return statusOnlyCommand(env, userId, argStr, 'paused',
+    `Usage: /pause <id>\nPauses a task — still visible in your lists, but skipped by the free-time nudger and by "what's active now".`,
+    (t) => `Paused: ${formatTaskLine(t)}`,
+  );
+}
+
+export async function cmdResumeTask(
+  env: Env, userId: number, argStr: string,
+): Promise<string> {
+  return statusOnlyCommand(env, userId, argStr, 'pending',
+    `Usage: /resume <id>\nUnpauses a task — back in the pool for free-time nudges.`,
+    (t) => `Resumed: ${formatTaskLine(t)}`,
+  );
+}
+
+export async function cmdStartTask(
+  env: Env, userId: number, argStr: string,
+): Promise<string> {
+  return statusOnlyCommand(env, userId, argStr, 'in_progress',
+    `Usage: /starttask <id>\nMarks a task as active right now.`,
+    (t) => `Started: ${formatTaskLine(t)}`,
+  );
+}
+
+export async function cmdFinishTask(
+  env: Env, userId: number, argStr: string,
+): Promise<string> {
+  return statusOnlyCommand(env, userId, argStr, 'done',
+    `Usage: /finishtask <id>\nMarks a task as done.`,
+    (t) => `Finished: ${formatTaskLine(t)}`,
+  );
 }
 
 // ---------------------------------------------------------------
@@ -233,7 +308,7 @@ interface ParsedTagFields {
   time_estimate_minutes?: number | null;
   scheduled_for?: string | null;
   context_note?: string | null;
-  status?: 'pending' | 'in_progress' | 'done' | 'cancelled';
+  status?: TaskStatus;
   is_recurring?: boolean;
   recurrence_rule?: RecurrenceRule | null;
 }
@@ -296,8 +371,8 @@ function parseTagList(
       case 'status': {
         if (!allowStatus) return { ok: false, error: `status not settable here` };
         const s = value.toLowerCase();
-        if (!['pending', 'in_progress', 'done', 'cancelled'].includes(s)) {
-          return { ok: false, error: `status must be one of pending|in_progress|done|cancelled` };
+        if (!['pending', 'in_progress', 'paused', 'done', 'cancelled'].includes(s)) {
+          return { ok: false, error: `status must be one of pending|in_progress|paused|done|cancelled` };
         }
         fields.status = s as ParsedTagFields['status'];
         break;
