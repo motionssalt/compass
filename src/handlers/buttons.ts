@@ -28,8 +28,9 @@ import {
 import { upsertUser, getUserTimezone, setUserTimezone, isValidIanaTimezone, setUserDefaultCurrency } from '../db/users';
 import {
   listTasksByFilter, listOpenTasks, listAllOpenTasks,
-  createTask, editTask, deleteTask, getTaskById,
+  createTask, editTask, deleteTask, getTaskById, updateTaskStatus,
 } from '../db/tasks';
+import type { TaskStatus } from '../types/task';
 import { resetUserData } from '../db/reset';
 import {
   getBalance, setBalance, adjustBalance, moveToSetAside, moveFromSetAside,
@@ -242,6 +243,48 @@ async function handleTasks(
       ? `No open tasks. Everything is either done or you haven't added anything yet.`
       : `All open tasks (${tasks.length}):\n${tasks.map(formatTaskLine).join('\n')}`;
     await editOrSend(env, msg, body, tasksMenuKeyboard());
+    return;
+  }
+
+  // Direct status-change pickers (Start / Finish / Pause / Resume).
+  // Each shows the SAME open-task picker Edit Task and Delete Task
+  // already use; the purpose token carries the eventual status
+  // change through to the shared 'tpick' handler below so all task-
+  // picker traffic flows through one codepath.
+  //
+  // For Pause we only offer tasks that are actually pausable
+  // (pending or in_progress); for Resume we only offer paused tasks.
+  // Otherwise the picker would be full of nonsensical targets. Start
+  // and Finish stay broad — the shared 'tpick' handler no-ops if
+  // the task is already in the target status.
+  if (action === 'startpick' || action === 'finishpick'
+      || action === 'pausepick' || action === 'resumepick') {
+    const open = await listOpenTasks(env.DB, userId);
+    const purpose =
+      action === 'startpick'  ? 'start' :
+      action === 'finishpick' ? 'finish' :
+      action === 'pausepick'  ? 'pause' :
+      /* resumepick */          'resume';
+    const filtered =
+      purpose === 'pause'  ? open.filter((t) => t.status === 'pending' || t.status === 'in_progress') :
+      purpose === 'resume' ? open.filter((t) => t.status === 'paused') :
+      open;
+    if (filtered.length === 0) {
+      const label =
+        purpose === 'pause'  ? `No pausable tasks — nothing pending or in progress.` :
+        purpose === 'resume' ? `No paused tasks to resume.` :
+        `No open tasks.`;
+      await editOrSend(env, msg, label, tasksMenuKeyboard());
+      return;
+    }
+    const prompt =
+      purpose === 'start'  ? `Pick a task to start:` :
+      purpose === 'finish' ? `Pick a task to finish:` :
+      purpose === 'pause'  ? `Pick a task to pause:` :
+      /* resume */          `Pick a task to resume:`;
+    await editOrSend(env, msg, prompt,
+      taskPickerKeyboard(filtered, purpose),
+    );
     return;
   }
 
@@ -588,10 +631,13 @@ async function handleFlow(
     return 'unknown purpose';
   }
 
-  // Task-picker for edit-task or delete-task.
+  // Task-picker for edit-task, delete-task, or the new direct
+  // status-change pickers (start / finish / pause / resume).
   if (action === 'tpick') {
     const purpose = args[0];
-    if (purpose !== 'edit' && purpose !== 'delete') return 'unknown purpose';
+    if (purpose !== 'edit' && purpose !== 'delete'
+        && purpose !== 'start' && purpose !== 'finish'
+        && purpose !== 'pause' && purpose !== 'resume') return 'unknown purpose';
     const id = parseInt(args[1] ?? '', 10);
     if (!Number.isFinite(id) || id <= 0) return 'bad id';
     const existing = await getTaskById(env.DB, userId, id);
@@ -599,6 +645,38 @@ async function handleFlow(
       await editOrSend(env, msg, `That task is gone. Try again.`, tasksMenuKeyboard());
       await clearFlow(env.DB, userId);
       return;
+    }
+    // Route through the SAME updateTaskStatus helper the AI's
+    // update_task_status / pause_task / resume_task tools and
+    // /starttask, /finishtask, /pause, /resume slash-commands call —
+    // no forked logic.
+    if (purpose === 'start' || purpose === 'finish'
+        || purpose === 'pause' || purpose === 'resume') {
+      const targetStatus: TaskStatus =
+        purpose === 'start'  ? 'in_progress' :
+        purpose === 'finish' ? 'done' :
+        purpose === 'pause'  ? 'paused' :
+        /* resume */          'pending';
+      if (existing.status === targetStatus) {
+        await editOrSend(env, msg,
+          `Task #${id} is already ${targetStatus}.`,
+          tasksMenuKeyboard(),
+        );
+        await clearFlow(env.DB, userId);
+        return purpose;
+      }
+      const updated = await updateTaskStatus(env.DB, userId, id, targetStatus);
+      const verb =
+        purpose === 'start'  ? 'Started' :
+        purpose === 'finish' ? 'Finished' :
+        purpose === 'pause'  ? 'Paused' :
+        /* resume */          'Resumed';
+      await editOrSend(env, msg,
+        updated ? `${verb}: ${formatTaskLine(updated)}` : `No task #${id}.`,
+        tasksMenuKeyboard(),
+      );
+      await clearFlow(env.DB, userId);
+      return purpose;
     }
     if (purpose === 'delete') {
       // Second-stage gate — same pending_confirmations mechanism the
@@ -680,9 +758,9 @@ async function handleFlow(
     const id = parseInt(args[0] ?? '', 10);
     const status = args[1];
     if (!Number.isFinite(id) || !status) return 'bad args';
-    if (!['pending', 'in_progress', 'done', 'cancelled'].includes(status)) return 'bad status';
+    if (!['pending', 'in_progress', 'paused', 'done', 'cancelled'].includes(status)) return 'bad status';
     const updated = await editTask(env.DB, userId, id, {
-      status: status as 'pending' | 'in_progress' | 'done' | 'cancelled',
+      status: status as TaskStatus,
     });
     if (!updated) {
       await editOrSend(env, msg, `No task #${id}.`, tasksMenuKeyboard());
