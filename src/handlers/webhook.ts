@@ -26,6 +26,7 @@ import { arrayBufferToBase64 } from '../utils/base64';
 import {
   cmdAddTask, cmdAddBatch, cmdEditTask, cmdReviewFlexible,
   cmdPauseTask, cmdResumeTask, cmdStartTask, cmdFinishTask,
+  cmdSchedule,
 } from './directTasks';
 import {
   processCallbackQuery, openMenu, tryHandleFlowText,
@@ -173,6 +174,7 @@ async function handleSlashCommand(env: Env, msg: TelegramMessage): Promise<boole
         `Just talk to me normally — text or voice. Some things you can try:\n` +
         `• "I need to submit the report by Friday, it's important"\n` +
         `• "add daily Bible study as a recurring task"\n` +
+        `• "only weekday mornings before Aug 15" (schedule constraint)\n` +
         `• "what should I do now?"  or  "I'm tired — anything light?"\n` +
         `• "I'm done with the groceries"\n` +
         `• "I just got paid 500"\n` +
@@ -183,9 +185,10 @@ async function handleSlashCommand(env: Env, msg: TelegramMessage): Promise<boole
         `Tasks:\n` +
         `/today — today's tasks\n` +
         `/alltasks — every open task (today + non-today combined; also /all)\n` +
-        `/addtask <title> [| p=A] [| dur=45] [| when=tonight] [| note=...] — add one task (also /add)\n` +
+        `/addtask <title> [| p=A] [| dur=45] [| when=tonight] [| note=...] [| constraint=days:mon,wed;time:07:00-08:00] — add one task (also /add)\n` +
         `/addbatch — add several tasks at once, one per line (also /batch)\n` +
-        `/edittask <id> [| field=value ...] — edit a task by id (also /edit)\n` +
+        `/edittask <id> [| field=value ...] — edit a task by id (also /edit). Fields include \`constraint=\` (same mini-syntax as /schedule).\n` +
+        `/schedule <id> [dates:YYYY-MM-DD..YYYY-MM-DD] [days:mon,wed,fri] [time:HH:MM-HH:MM] — set a scheduling window on a task; \`/schedule <id> clear\` removes it; \`/schedule <id>\` shows the current one\n` +
         `/deletetask [id] — delete a task by id (asks to confirm; also /del)\n` +
         `/starttask <id> — mark a task as active right now (also /begin)\n` +
         `/finishtask <id> — mark a task as done yourself (also /done)\n` +
@@ -416,6 +419,17 @@ async function handleSlashCommand(env: Env, msg: TelegramMessage): Promise<boole
     case '/edittask':
     case '/edit': {
       const reply = await cmdEditTask(env, userId, argStr);
+      await sendMessage(env, msg.chat.id, reply);
+      return true;
+    }
+
+    case '/schedule':
+    case '/constraint': {
+      // Dedicated slash-command for the scheduling-constraint field.
+      // Routes through the SAME editTask helper /edittask, the AI's
+      // edit_task tool, and the button flow's Constraint editor all
+      // funnel through — no forked logic.
+      const reply = await cmdSchedule(env, userId, argStr);
       await sendMessage(env, msg.chat.id, reply);
       return true;
     }
