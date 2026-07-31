@@ -97,6 +97,16 @@ export function tasksMenuKeyboard(): InlineKeyboardMarkup {
     [btn('🔀 Flexible (by priority)', cb('tasks', 'flex'))],
     [btn('➕ Add task',      cb('tasks', 'add'))],
     [btn('✏️ Edit task',     cb('tasks', 'editpick'))],
+    // Direct status changes — same picker under the hood as Edit /
+    // Delete, purpose token routes to the shared 'tpick' handler.
+    [
+      btn('▶️ Start',  cb('tasks', 'startpick')),
+      btn('✅ Finish', cb('tasks', 'finishpick')),
+    ],
+    [
+      btn('⏸️ Pause',  cb('tasks', 'pausepick')),
+      btn('▶️ Resume', cb('tasks', 'resumepick')),
+    ],
     [btn('🗑️ Delete task',   cb('tasks', 'delpick'))],
     [btn('« Back',           cb('nav',   'root'))],
   ]);
@@ -237,7 +247,7 @@ export function confirmCreateKeyboard(): InlineKeyboardMarkup {
 
 export function taskPickerKeyboard(
   tasks: { id: number; title: string; priority: number }[],
-  purpose: 'edit' | 'delete',
+  purpose: 'edit' | 'delete' | 'start' | 'finish' | 'pause' | 'resume',
 ): InlineKeyboardMarkup {
   const rows: InlineKeyboardButton[][] = [];
   for (const t of tasks.slice(0, 12)) {
@@ -265,6 +275,7 @@ export function statusPickerKeyboard(taskId: number): InlineKeyboardMarkup {
   return keyboard([
     [btn('Pending',     cb('flow', 'estatus', String(taskId), 'pending'))],
     [btn('In progress', cb('flow', 'estatus', String(taskId), 'in_progress'))],
+    [btn('Paused',      cb('flow', 'estatus', String(taskId), 'paused'))],
     [btn('Done',        cb('flow', 'estatus', String(taskId), 'done'))],
     [btn('Cancelled',   cb('flow', 'estatus', String(taskId), 'cancelled'))],
     [btn('✖️ Cancel', cb('flow', 'cancel'))],
