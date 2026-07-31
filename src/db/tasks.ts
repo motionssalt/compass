@@ -11,12 +11,24 @@ import {
 // ---------------------------------------------------------------
 
 export async function listOpenTasks(db: D1Database, userId: number): Promise<Task[]> {
+  // "Open" here means "still on the user's list": pending, in_progress,
+  // AND paused. A paused task is deliberately parked by the user — it
+  // must stay visible in every listing / picker /today /alltasks, but
+  // the free-time nudger (utils/nudgeScoring.ts) and the "are you busy
+  // right now?" check (utils/freeWindow.ts) both inspect status by
+  // EXACT value and gate only on 'pending' / 'in_progress'
+  // respectively. Widening the listing here does NOT, therefore,
+  // accidentally cause the nudger to surface a paused row.
   const { results } = await db.prepare(
     `SELECT * FROM tasks
       WHERE user_id = ?1
-        AND status IN ('pending','in_progress')
+        AND status IN ('pending','in_progress','paused')
       ORDER BY
-        CASE status WHEN 'in_progress' THEN 0 ELSE 1 END,
+        CASE status
+          WHEN 'in_progress' THEN 0
+          WHEN 'pending'     THEN 1
+          WHEN 'paused'      THEN 2
+          ELSE 3 END,
         priority ASC,
         created_at ASC`,
   ).bind(userId).all<Task>();
@@ -24,7 +36,7 @@ export async function listOpenTasks(db: D1Database, userId: number): Promise<Tas
 }
 
 /**
- * All open (pending/in_progress) tasks regardless of scheduled date.
+ * All open (pending/in_progress/paused) tasks regardless of scheduled date.
  *
  * This is deliberately a thin wrapper around the same base query
  * listOpenTasks uses — the /alltasks command and its menu button
@@ -40,7 +52,7 @@ export async function listAllOpenTasks(db: D1Database, userId: number): Promise<
 export async function listTasksByFilter(
   db: D1Database,
   userId: number,
-  filter: 'pending' | 'in_progress' | 'done' | 'cancelled' | 'today' | 'recurring',
+  filter: 'pending' | 'in_progress' | 'paused' | 'done' | 'cancelled' | 'today' | 'recurring',
   timezone: string,
 ): Promise<Task[]> {
   if (filter === 'recurring') {
@@ -60,6 +72,8 @@ export async function listTasksByFilter(
     //   * unscheduled (scheduled_for is null/empty) — a freshly added
     //     open task with no explicit schedule belongs on today's list;
     //     otherwise newly created tasks never surface in /today.
+    // Paused tasks are included so the user can still see them in /today
+    // (a paused task is still on the list), prefixed with ⏸.
     const now = new Date();
     const weekday = localWeekday(now, timezone);
     const todayLocal = localDateString(now, timezone);
@@ -248,8 +262,12 @@ export async function deleteTask(
 
 /**
  * For every recurring task whose rule fires today, if its current
- * status is done/cancelled, flip it back to pending so it shows up
- * again in "what should I do now?".
+ * status is done/cancelled (and only those), flip it back to pending
+ * so it shows up again in "what should I do now?".
+ *
+ * Deliberately does NOT touch paused rows here: a paused task is a
+ * user choice, not a completion. The cron must not silently unpause
+ * a task the user is parking.
  */
 export async function resetRecurringForDay(
   db: D1Database, timezone: string,
