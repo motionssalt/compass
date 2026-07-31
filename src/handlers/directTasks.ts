@@ -8,7 +8,7 @@
 //
 // Batch entry syntax (one task per line):
 //
-//     Title text | priority=B+ | dur=45 | when=morning | note=foo
+//     Title text | priority=B+ | dur=45 | when=morning | note=foo | constraint=days:mon,wed;time:07:00-08:00
 //
 // Only the title is required. Recognised tags (case-insensitive,
 // order irrelevant, `|` separates them from each other and from the
@@ -18,16 +18,33 @@
 //   dur=       or  time=  or  est=      minutes (positive integer)
 //   when=      or  sched=  or  at=      loose text or ISO datetime
 //   note=      or  ctx=                  free-text context
+//   constraint= or window= or c=        scheduling constraint (see below)
 //
 // A `#` at the start of a line is a comment. Blank lines are
 // skipped. Any line that starts with `-` or `•` has that bullet
 // stripped so pasted bulleted lists just work.
+//
+// Scheduling-constraint mini-syntax
+// ---------------------------------
+// The `constraint=` tag carries a compact, semicolon-separated
+// sub-syntax that parses into the SAME SchedulingConstraint shape
+// the AI tools and the button flow produce (see
+// src/utils/scheduleConstraint.ts — one parser, no forks):
+//
+//   constraint=dates:2026-08-01..2026-08-15;days:mon,wed,fri;time:07:00-08:00
+//
+// Any subset is legal (all three sub-keys are independent). Either
+// side of `dates:` may be a `-` or empty for an open-ended range.
+// The literal values `none`, `clear`, `off`, or an empty value
+// remove any existing constraint. On `/addtask` an omitted or empty
+// `constraint=` means \"no constraint\" (the default).
 
 import type { Env } from '../types/env';
-import type { RecurrenceRule } from '../types/shared';
+import type { RecurrenceRule, SchedulingConstraint } from '../types/shared';
 import type { Task, TaskStatus } from '../types/task';
 import {
   createTask, editTask, getTaskById, listOpenTasks, updateTaskStatus,
+  parseScheduleConstraint, safeParseStoredConstraint,
   type CreateTaskInput, type EditFields,
 } from '../db/tasks';
 import { sendMessage } from '../services/telegram';
@@ -49,7 +66,7 @@ export async function cmdAddTask(
 ): Promise<string> {
   if (!argStr.trim()) {
     return (
-      `Usage: /addtask <title> [| priority=B+] [| dur=45] [| when=morning] [| note=...]\n` +
+      `Usage: /addtask <title> [| priority=B+] [| dur=45] [| when=morning] [| note=...] [| constraint=days:mon,wed;time:07:00-08:00]\n` +
       `Example: /addtask Draft the report | p=A | dur=90 | when=this afternoon`
     );
   }
@@ -125,8 +142,9 @@ export async function cmdEditTask(
   if (!argStr.trim()) {
     return (
       `Usage: /edittask <id> field=value [| field=value ...]\n` +
-      `Fields: title, priority (A+..E-), dur (minutes), when, note, status (pending|in_progress|paused|done|cancelled)\n` +
-      `Example: /edittask 12 | p=A- | dur=30 | when=tonight`
+      `Fields: title, priority (A+..E-), dur (minutes), when, note, status (pending|in_progress|paused|done|cancelled), constraint (see /schedule)\n` +
+      `Example: /edittask 12 | p=A- | dur=30 | when=tonight\n` +
+      `Example: /edittask 12 | constraint=days:mon,wed,fri;time:07:00-08:00`
     );
   }
 
@@ -150,6 +168,76 @@ export async function cmdEditTask(
   const updated = await editTask(env.DB, userId, id, parsed.fields);
   if (!updated) return `No task #${id}.`;
   return `Updated: ${formatTaskLine(updated)}`;
+}
+
+/**
+ * /schedule <id> [constraint-parts...]
+ *
+ * Dedicated slash-command for the scheduling-constraint field. Takes
+ * the SAME mini-syntax the `constraint=` tag on /addtask and /edittask
+ * uses (semicolon- OR pipe-separated `key:value` pairs) but without the
+ * outer `constraint=` wrapper — this is the whole command's purpose,
+ * so the wrapper would just be noise.
+ *
+ * Examples:
+ *   /schedule 12 days:mon,wed,fri; time:07:00-08:00
+ *   /schedule 12 dates:2026-08-01..2026-08-15
+ *   /schedule 12 clear
+ *   /schedule 12                    (show current)
+ *
+ * Routes through the SAME editTask helper the AI's edit_task tool and
+ * the button flow call. No forked logic; the field itself is validated
+ * by parseScheduleConstraint just like every other write path.
+ */
+export async function cmdSchedule(
+  env: Env, userId: number, argStr: string,
+): Promise<string> {
+  if (!argStr.trim()) {
+    return (
+      `Usage: /schedule <id> [dates:YYYY-MM-DD..YYYY-MM-DD] [days:mon,wed,fri] [time:HH:MM-HH:MM]\n` +
+      `       /schedule <id> clear     — remove any existing constraint\n` +
+      `       /schedule <id>           — show the current constraint\n` +
+      `Any subset is legal; all three sub-keys are independent of each\n` +
+      `other AND of scheduled_for / recurrence. Either side of \`dates:\`\n` +
+      `may be \`-\` or empty for an open-ended range.\n\n` +
+      `Example: /schedule 12 days:mon,wed,fri; time:07:00-08:00\n` +
+      `Example: /schedule 12 dates:2026-08-01..2026-08-15`
+    );
+  }
+
+  // Parse "<id> <rest>" — the id is the first whitespace-separated
+  // token; everything after is the constraint expression.
+  const m = /^\s*#?(\d+)\s*(.*)$/s.exec(argStr);
+  if (!m) return `Couldn't read a task id from "${argStr.slice(0, 40)}".`;
+  const id = parseInt(m[1], 10);
+  const rest = (m[2] ?? '').trim();
+  if (!Number.isFinite(id) || id <= 0) return `Invalid task id.`;
+
+  const existing = await getTaskById(env.DB, userId, id);
+  if (!existing) return `No task #${id}.`;
+
+  // Bare "/schedule <id>" — show the current constraint.
+  if (!rest) {
+    const current = safeParseStoredConstraint(existing.schedule_constraint);
+    const summary = formatConstraint(current);
+    return (
+      `#${id} ${existing.title}\n` +
+      `Constraint: ${summary}\n\n` +
+      `Change it with e.g. /schedule ${id} days:mon,wed,fri; time:07:00-08:00\n` +
+      `Clear it with /schedule ${id} clear`
+    );
+  }
+
+  const parsed = parseConstraintExpression(rest);
+  if (!parsed.ok) return `Couldn't set constraint: ${parsed.error}`;
+
+  const updated = await editTask(env.DB, userId, id, {
+    schedule_constraint: parsed.value,
+  });
+  if (!updated) return `No task #${id}.`;
+
+  const summary = formatConstraint(safeParseStoredConstraint(updated.schedule_constraint));
+  return `Updated: ${formatTaskLine(updated)}\nConstraint: ${summary}`;
 }
 
 export async function cmdReviewFlexible(
@@ -278,6 +366,9 @@ function parseTaskLine(line: string): ParseTaskOk | ParseFail {
   if (parsedTags.fields.context_note !== undefined) {
     input.context_note = parsedTags.fields.context_note;
   }
+  if (parsedTags.fields.schedule_constraint !== undefined) {
+    input.schedule_constraint = parsedTags.fields.schedule_constraint;
+  }
   return { ok: true, input };
 }
 
@@ -299,6 +390,9 @@ function parseEditFields(rest: string): ParseEditOk | ParseFail {
     fields.context_note = parsedTags.fields.context_note;
   }
   if (parsedTags.fields.status !== undefined) fields.status = parsedTags.fields.status;
+  if (parsedTags.fields.schedule_constraint !== undefined) {
+    fields.schedule_constraint = parsedTags.fields.schedule_constraint;
+  }
   return { ok: true, fields };
 }
 
@@ -311,6 +405,13 @@ interface ParsedTagFields {
   status?: TaskStatus;
   is_recurring?: boolean;
   recurrence_rule?: RecurrenceRule | null;
+  /**
+   * Parsed scheduling constraint. `undefined` means the tag wasn't
+   * present (leave the field alone on edit; store null on create).
+   * `null` means the tag WAS present with a `clear`/empty value —
+   * clear any existing constraint.
+   */
+  schedule_constraint?: SchedulingConstraint | null;
 }
 interface ParseTagsOk { ok: true; fields: ParsedTagFields }
 
@@ -327,7 +428,12 @@ function parseTagList(
     }
     const key = tag.slice(0, eq).trim().toLowerCase();
     const value = tag.slice(eq + 1).trim();
-    if (!value) return { ok: false, error: `empty value for "${key}"` };
+    // Constraint tag is special: a bare `constraint=` (empty value)
+    // is meaningful — it clears the field. Every other tag still
+    // requires a non-empty value.
+    const isConstraintKey =
+      key === 'constraint' || key === 'window' || key === 'c';
+    if (!value && !isConstraintKey) return { ok: false, error: `empty value for "${key}"` };
 
     switch (key) {
       case 'title':
@@ -377,6 +483,19 @@ function parseTagList(
         fields.status = s as ParsedTagFields['status'];
         break;
       }
+      case 'constraint':
+      case 'window':
+      case 'c': {
+        // Same mini-syntax as /schedule. Routes through the SAME
+        // parseScheduleConstraint that validates every other write
+        // path (AI tool, button flow) — no forked logic.
+        const parsed = parseConstraintExpression(value);
+        if (!parsed.ok) {
+          return { ok: false, error: `constraint: ${parsed.error}` };
+        }
+        fields.schedule_constraint = parsed.value;
+        break;
+      }
       default:
         return { ok: false, error: `unknown tag "${key}"` };
     }
@@ -418,6 +537,137 @@ function parseDurationMinutes(v: string): number | null {
 }
 
 // ---------------------------------------------------------------
+// Scheduling-constraint mini-syntax
+// ---------------------------------------------------------------
+//
+// Compact, human-writable expression that maps to the same
+// SchedulingConstraint shape the AI tools and the button flow
+// produce. Everything eventually funnels through
+// parseScheduleConstraint (src/utils/scheduleConstraint.ts) — this
+// function only tokenises the string form, it never validates the
+// semantic constraints itself.
+//
+// Grammar (informal):
+//   expr    := "clear" | "none" | "off" | ""    -> null (clear)
+//            | pair (SEP pair)*
+//   pair    := "dates:" range
+//            | "days:"  daycsv
+//            | "time:"  timerange
+//   SEP     := ";" or "|" or ","-around-a-pair-boundary
+//
+// The parser is intentionally forgiving: separators can be `;` or
+// `|`, whitespace is tolerated everywhere, and sub-keys are
+// case-insensitive.
+
+export interface ParseConstraintOk {
+  ok: true;
+  value: SchedulingConstraint | null;
+}
+
+/**
+ * Turn a mini-syntax expression into a validated SchedulingConstraint
+ * (or null to clear). Exported so the button flow's free-text follow-
+ * up paths can share the exact same parser.
+ */
+export function parseConstraintExpression(
+  expr: string,
+): ParseConstraintOk | ParseFail {
+  const trimmed = (expr ?? '').trim();
+  if (!trimmed) return { ok: true, value: null };
+  const lower = trimmed.toLowerCase();
+  if (lower === 'clear' || lower === 'none' || lower === 'off' || lower === '-') {
+    return { ok: true, value: null };
+  }
+
+  // Split on `;` or `|` — either separator works. Trim empties.
+  const pairs = trimmed.split(/[;|]/).map((s) => s.trim()).filter((s) => s.length > 0);
+
+  const obj: Record<string, unknown> = {};
+  for (const pair of pairs) {
+    const idx = pair.indexOf(':');
+    if (idx < 0) {
+      return { ok: false, error: `expected key:value in "${pair}"` };
+    }
+    const key = pair.slice(0, idx).trim().toLowerCase();
+    const value = pair.slice(idx + 1).trim();
+
+    if (key === 'dates' || key === 'date' || key === 'range') {
+      const range = parseDateRange(value);
+      if (!range.ok) return range;
+      obj.date_range = range.value;
+    } else if (key === 'days' || key === 'day' || key === 'dow') {
+      const days = parseDaysList(value);
+      if (!days.ok) return days;
+      obj.days_of_week = days.value;
+    } else if (key === 'time' || key === 'window' || key === 'hours') {
+      const tw = parseTimeWindow(value);
+      if (!tw.ok) return tw;
+      obj.time_of_day = tw.value;
+    } else {
+      return { ok: false, error: `unknown constraint key "${key}" (expected dates, days, or time)` };
+    }
+  }
+
+  // Delegate final shape validation (empties, day dedup, min/max
+  // ordering, HH:MM sanity, YYYY-MM-DD sanity) to the ONE place
+  // that owns it.
+  const parsed = parseScheduleConstraint(obj);
+  if (!parsed.ok) return { ok: false, error: parsed.error };
+  return { ok: true, value: parsed.constraint };
+}
+
+function parseDateRange(
+  value: string,
+): { ok: true; value: { start?: string; end?: string } } | ParseFail {
+  // Accept "YYYY-MM-DD..YYYY-MM-DD" (canonical), or a single
+  // "YYYY-MM-DD" (both sides equal to that), or "..YYYY-MM-DD" /
+  // "YYYY-MM-DD.." for open-ended. Either side may be "-" for "no
+  // bound on that side".
+  const v = value.trim();
+  if (!v) return { ok: false, error: `dates: empty range` };
+  const parts = v.split('..');
+  let startRaw: string;
+  let endRaw: string;
+  if (parts.length === 1) {
+    startRaw = endRaw = parts[0];
+  } else if (parts.length === 2) {
+    startRaw = parts[0];
+    endRaw = parts[1];
+  } else {
+    return { ok: false, error: `dates: expected YYYY-MM-DD..YYYY-MM-DD, got "${v}"` };
+  }
+  const range: { start?: string; end?: string } = {};
+  const s = startRaw.trim();
+  const e = endRaw.trim();
+  if (s && s !== '-') range.start = s;
+  if (e && e !== '-') range.end = e;
+  return { ok: true, value: range };
+}
+
+function parseDaysList(
+  value: string,
+): { ok: true; value: string[] } | ParseFail {
+  const raw = value.trim();
+  if (!raw) return { ok: false, error: `days: empty` };
+  // Accept comma OR whitespace as separator.
+  const parts = raw.split(/[,\s]+/).map((s) => s.trim()).filter((s) => s.length > 0);
+  return { ok: true, value: parts };
+}
+
+function parseTimeWindow(
+  value: string,
+): { ok: true; value: { start: string; end: string } } | ParseFail {
+  const raw = value.trim();
+  if (!raw) return { ok: false, error: `time: empty` };
+  // Accept "HH:MM-HH:MM" or "HH:MM..HH:MM".
+  const m = /^(\d{1,2}:\d{2})\s*(?:-|\.\.|to|—)\s*(\d{1,2}:\d{2})$/i.exec(raw);
+  if (!m) {
+    return { ok: false, error: `time: expected HH:MM-HH:MM, got "${raw}"` };
+  }
+  return { ok: true, value: { start: m[1], end: m[2] } };
+}
+
+// ---------------------------------------------------------------
 // Formatting
 // ---------------------------------------------------------------
 
@@ -430,8 +680,47 @@ function formatTaskLine(t: Task): string {
     bits.push(`~${t.time_estimate_minutes}min`);
   }
   if (t.scheduled_for) bits.push(`— ${t.scheduled_for}`);
+  const constraint = safeParseStoredConstraint(t.schedule_constraint);
+  if (constraint) {
+    const summary = formatConstraintShort(constraint);
+    if (summary) bits.push(`⟨${summary}⟩`);
+  }
   if (t.status !== 'pending') bits.push(`[${t.status}]`);
   return `• ${bits.join(' ')}`;
+}
+
+/**
+ * Compact single-line rendering of a constraint for inline task
+ * listings. Empty when there's nothing to show. Same style as the
+ * one in src/ai/systemPrompt.ts#summariseConstraint — kept here as
+ * a peer rather than a shared helper because the two formats differ
+ * on separators (this one uses commas/semicolons to fit the ⟨…⟩
+ * bracket look, the AI one uses spaces to fit the bar-delimited
+ * task line).
+ */
+function formatConstraintShort(c: SchedulingConstraint | null): string {
+  if (!c) return '';
+  const parts: string[] = [];
+  if (c.date_range) {
+    const { start, end } = c.date_range;
+    if (start && end) parts.push(`${start}→${end}`);
+    else if (start) parts.push(`from ${start}`);
+    else if (end) parts.push(`until ${end}`);
+  }
+  if (c.days_of_week && c.days_of_week.length > 0) parts.push(c.days_of_week.join(','));
+  if (c.time_of_day) parts.push(`${c.time_of_day.start}–${c.time_of_day.end}`);
+  return parts.join('; ');
+}
+
+/**
+ * Multi-line rendering for the /schedule show-current view. Says
+ * "none" plainly when the field is null so a bare `/schedule <id>`
+ * is a self-contained explanation.
+ */
+export function formatConstraint(c: SchedulingConstraint | null): string {
+  if (!c) return 'none';
+  const s = formatConstraintShort(c);
+  return s || 'none';
 }
 
 // ---------------------------------------------------------------
