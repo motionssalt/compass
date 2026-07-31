@@ -1,0 +1,94 @@
+-- Motionsalt Compass — per-task scheduling-constraint layer.
+--
+-- Same conventions as prior migrations:
+--   * ISO-8601 UTC TEXT timestamps
+--   * booleans as 0/1 INTEGERs
+--   * IDs are AUTOINCREMENT INTEGER
+--   * structured payloads go in TEXT columns as JSON — same pattern
+--     already used by tasks.recurrence_rule
+--
+-- Background. Tasks so far have carried at most a single loose
+-- `scheduled_for` string plus, for recurring rows, a `recurrence_rule`
+-- describing the cadence. That is not enough to express things like
+--
+--     "any weekday morning between now and Aug 15"
+--     "Mon/Wed/Fri, only between 07:00 and 08:00"
+--     "some time before Friday"
+--
+-- The user should be able to combine, freely and optionally, three
+-- independent scheduling constraints on top of whatever recurrence
+-- rule (if any) already governs the task:
+--
+--   * date_range     — start and/or end wall-clock dates (either side
+--                      optional; open-ended windows are legal)
+--   * time_of_day    — a daily HH:MM..HH:MM window in the user's zone
+--                      (wraparound windows like 22:00..02:00 supported)
+--   * days_of_week   — the same short weekday codes recurrence_rule
+--                      already uses: mon, tue, wed, thu, fri, sat, sun
+--
+-- Any combination is valid; all three fields are optional and
+-- independent of one another AND of `is_recurring` / `recurrence_rule`.
+-- Semantically the constraint is ADDITIVE: a task is currently
+-- "constraint-satisfied" iff every present sub-constraint is
+-- satisfied at the reference instant in the user's timezone.
+--
+-- Storage: one JSON blob in `schedule_constraint` — same shape rule
+-- as `recurrence_rule` — instead of three columns, so future sub-
+-- constraints (e.g. exclusion dates, blackout windows) can slot in
+-- without another migration.
+--
+-- Missed-cycle bookkeeping. For a recurring task, when a scheduled
+-- window closes without completion we want to remember that the
+-- current cycle was missed — WITHOUT changing status (a missed cycle
+-- must not affect the next occurrence: the daily reset in
+-- src/db/tasks.resetRecurringForDay must still flip the row back to
+-- pending tomorrow as usual). We record it as an opaque cycle key
+-- (e.g. "daily:2026-07-31", "weekly:2026-W31") — one string, easy to
+-- compare, easy to clear on completion of the next cycle. Nothing
+-- outside the nudge path reads it.
+--
+-- Both columns are additive TEXT with sensible NULL defaults, so
+-- unmigrated code paths and unmigrated rows keep working unchanged.
+
+-- ---------------------------------------------------------------
+-- tasks.schedule_constraint
+-- ---------------------------------------------------------------
+-- JSON blob; null means "no scheduling constraint". Shape:
+--   {
+--     "date_range":   { "start": "YYYY-MM-DD", "end": "YYYY-MM-DD" },
+--     "time_of_day":  { "start": "HH:MM",      "end": "HH:MM"      },
+--     "days_of_week": ["mon","tue",...]
+--   }
+-- Every top-level key is optional; inside date_range and time_of_day
+-- either sub-key may be omitted (an open-ended date range is legal;
+-- time_of_day requires both sides to be meaningful — the helper in
+-- src/utils/scheduleConstraint.ts enforces that at write time).
+ALTER TABLE tasks ADD COLUMN schedule_constraint TEXT;
+
+-- ---------------------------------------------------------------
+-- tasks.missed_cycle_key
+-- ---------------------------------------------------------------
+-- Opaque cycle identifier stamped when the nudger observes that a
+-- recurring task's constraint window has closed for the current
+-- cycle without completion. Null means "not currently in a missed
+-- state". Cleared on completion or when a fresh cycle opens.
+--
+-- Deliberately NOT a boolean: keying by cycle lets us detect that a
+-- new cycle has started (missed_cycle_key != current cycle key) and
+-- clear the flag automatically, so the daily reset does not need to
+-- know about this column at all.
+ALTER TABLE tasks ADD COLUMN missed_cycle_key TEXT;
+
+-- Query shape used by the nudge scorer: "for user U, which of their
+-- open tasks currently satisfy their constraint?" is answered in
+-- application code (JSON parsing in D1 is deliberately avoided in
+-- this codebase), but we still benefit from the same (user_id,
+-- status) locality the existing idx_tasks_user_status provides — no
+-- new index needed here.
+--
+-- We add ONE narrow index on missed_cycle_key so the housekeeping
+-- pass that clears stale keys (see src/db/tasks.clearStaleMissedCycles)
+-- doesn't have to full-scan tasks.
+CREATE INDEX IF NOT EXISTS idx_tasks_missed_cycle
+  ON tasks (user_id, missed_cycle_key)
+  WHERE missed_cycle_key IS NOT NULL;
