@@ -63,17 +63,41 @@ export const TOOL_DECLARATIONS = [
   {
     name: 'update_task_status',
     description:
-      'Change a task\'s status. Use "done" when the user finished it, "in_progress" when they say they are working on it, "pending" to reopen.',
+      'Change a task\'s status. Use "done" when the user finished it, "in_progress" when they say they are working on it (or are about to start), "paused" when they are parking it for now (still on the list, but skipped by the free-time nudger and not counted as "active right now"), "pending" to reopen or unpause. Prefer the dedicated pause_task / resume_task tools when the intent is specifically to park / unpark — they read more clearly to future you.',
     parameters: {
       type: 'OBJECT',
       properties: {
         task_id: { type: 'INTEGER', description: 'ID of the task from the open-task list.' },
         status: {
           type: 'STRING',
-          description: 'One of: pending, in_progress, done, cancelled.',
+          description: 'One of: pending, in_progress, paused, done, cancelled.',
         },
       },
       required: ['task_id', 'status'],
+    },
+  },
+  {
+    name: 'pause_task',
+    description:
+      'Park a task the user wants to hold off on for now without dropping it. Convenience wrapper around update_task_status with status="paused". A paused task stays visible in every listing, but is skipped by the free-time nudger and does NOT count as "active right now". Use this when the user says things like "pause X", "put X on hold", "hold off on X for now", "snooze X". If they instead want to drop the task entirely, use cancel_task; if they simply finished, use update_task_status with status="done".',
+    parameters: {
+      type: 'OBJECT',
+      properties: {
+        task_id: { type: 'INTEGER' },
+      },
+      required: ['task_id'],
+    },
+  },
+  {
+    name: 'resume_task',
+    description:
+      'Unpause a previously paused task — restores it to "pending" so it re-enters the free-time nudge pool. Convenience wrapper around update_task_status with status="pending". Use when the user says "unpause X", "resume X", "back on X", "pick X back up". If the task is already pending / in_progress, this is a no-op.',
+    parameters: {
+      type: 'OBJECT',
+      properties: {
+        task_id: { type: 'INTEGER' },
+      },
+      required: ['task_id'],
     },
   },
   {
@@ -102,7 +126,7 @@ export const TOOL_DECLARATIONS = [
         filter: {
           type: 'STRING',
           description:
-            'One of: pending, in_progress, done, cancelled, today, recurring.',
+            'One of: pending, in_progress, paused, done, cancelled, today, recurring.',
         },
       },
       required: ['filter'],
