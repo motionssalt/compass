@@ -2,7 +2,7 @@ import type { Task } from '../types/task';
 import type { BalanceRow, DebtRow } from '../types/finance';
 import { formatMoney } from '../utils/money';
 import { priorityIntToLetter } from '../utils/priority';
-import { localTimeOfDay, localWeekday, localDateString } from '../utils/time';
+import { localNow } from '../utils/time';
 
 /**
  * Build the system prompt that establishes Compass's voice AND injects
@@ -12,22 +12,37 @@ import { localTimeOfDay, localWeekday, localDateString } from '../utils/time';
  * All new per-user state introduced alongside letter-grade priority
  * (set-aside bucket, default currency, recurring debts) rides along
  * inside this same prompt-build call — no separate per-turn tool call.
+ * The current clock reading rides along the same way: an exact local
+ * time is embedded below rather than exposed as a get_current_time
+ * tool, so the model has it before it starts reasoning and can never
+ * "forget" to look it up.
  */
 export function buildSystemPrompt(params: {
   userFirstName: string | null;
   timezone: string;
+  /**
+   * True when `timezone` is one the user actually chose, false when
+   * it's the Worker's DEFAULT_TIMEZONE standing in. Drives whether
+   * the clock reading is presented as fact or as a best guess.
+   */
+  timezoneIsExplicit: boolean;
+  /**
+   * The instant this turn is being handled, captured once by the
+   * caller. Passed in (rather than read here) so every part of the
+   * turn — prompt, tool results, nudge logic — describes the same
+   * moment.
+   */
+  now: Date;
   openTasks: Task[];
   balance: BalanceRow;
   openDebts: DebtRow[];
   defaultCurrency: string | null;
 }): string {
   const {
-    userFirstName, timezone, openTasks, balance, openDebts, defaultCurrency,
+    userFirstName, timezone, timezoneIsExplicit, now, openTasks, balance,
+    openDebts, defaultCurrency,
   } = params;
-  const now = new Date();
-  const dateStr = localDateString(now, timezone);
-  const weekday = localWeekday(now, timezone);
-  const partOfDay = localTimeOfDay(now, timezone);
+  const clock = localNow(now, timezone);
 
   const taskLines = openTasks.length
     ? openTasks.map((t) => {
@@ -73,6 +88,14 @@ export function buildSystemPrompt(params: {
     : '(no open debts right now)';
 
   const name = userFirstName ? userFirstName : 'the user';
+
+  // Timezone provenance changes what we're allowed to assert. With an
+  // explicit zone the clock line is simply true; with the fallback it
+  // is "the right time somewhere", so we label it and tell the model
+  // how to get it fixed.
+  const timezoneLine = timezoneIsExplicit
+    ? `${timezone} (UTC${clock.offset}) — set by ${name}`
+    : `${timezone} (UTC${clock.offset}) — NOT chosen by ${name}; this is the server default standing in`;
 
   const setAsideLine = balance.set_aside_cents && balance.set_aside_cents !== 0
     ? formatMoney(balance.set_aside_cents, balance.currency)
@@ -132,6 +155,41 @@ How you work (tasks):
 - Recurring tasks (daily/weekly habits like Bible study, prayer,
   language practice, coding practice) should be created with
   is_recurring=true and a recurrence_rule. A cron resets them daily.
+
+Knowing what time it is:
+- You DO know the current time. "Current context" below carries a
+  real clock reading — ${name}'s local date, weekday, and
+  hour:minute — taken at the moment this turn started, in their
+  timezone. It is refreshed every single turn.
+- Treat it as fact. Never guess, never hedge with "it's probably
+  around...", never ask ${name} what time or what day it is, and
+  never say you have no way to know. If they ask the time or the
+  date, answer straight from that block.
+- Do NOT infer the time from the conversation history. Earlier turns
+  happened earlier — possibly minutes ago, possibly days ago. Only
+  the reading in "Current context" is now. If an earlier turn said
+  "this morning" and the reading now says 22:14, the morning has
+  passed.
+- Resolve relative language against that reading. "In two hours",
+  "tonight", "tomorrow at 9", "end of the week", "in 20 minutes" all
+  anchor to it. When you can pin a task or debt to a concrete moment,
+  write scheduled_for / due as a full ISO datetime carrying the
+  offset (the same shape as the machine-readable local timestamp
+  below) — the free-time nudger can only reason about times it can
+  parse. Keep loose text only when the user genuinely stayed vague.
+- Use it in your judgment, not just your wording: whether a
+  scheduled task is now overdue, whether a deadline is close enough
+  to bump priority, whether it's too late in the evening to suggest
+  a two-hour job, whether a "daily" habit still has runway today.
+- Greet and recommend in a way that matches the actual hour. Don't
+  suggest a morning routine at 23:00 or wish ${name} a good night at
+  08:00.
+- If the Timezone line below says the zone was NOT chosen by
+  ${name}, then the clock reading is only as right as that guess. Say
+  so ONCE, lightly, when time actually matters to your answer, and
+  point at /timezone (or /menu → Settings → Timezone). Don't repeat
+  it every turn, and don't let it stall the reply — answer with the
+  reading you have.
 
 Priority — letter-grade scale (A+ through E-):
 - Priorities on tasks and urgencies on debts use the SAME letter
@@ -239,9 +297,10 @@ Confirmations:
   use plain phrasing like "you're at USD 1234.50 now".
 
 Current context:
-- Local date: ${dateStr} (${weekday})
-- Time of day: ${partOfDay}
-- Timezone: ${timezone}
+- Right now, ${name}'s local time: ${clock.weekdayLong}, ${clock.date}, ${clock.clock} (${clock.partOfDay})
+- Machine-readable local timestamp: ${clock.localIso}
+- Timezone: ${timezoneLine}
+- Same instant in UTC: ${clock.utcIso}
 
 ${name}'s currently open tasks (pending + in_progress + paused):
 ${taskLines}
