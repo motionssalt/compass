@@ -1,0 +1,51 @@
+-- Motionsalt Compass — restore tasks.time_estimate_minutes.
+--
+-- Same conventions as prior migrations:
+--   * ISO-8601 UTC TEXT timestamps
+--   * booleans as 0/1 INTEGERs
+--   * IDs are AUTOINCREMENT INTEGER
+--
+-- Why this migration exists
+-- -------------------------
+-- Migration 0003 added `tasks.time_estimate_minutes INTEGER` (nullable,
+-- no default). Migration 0006 later widened `tasks.status`' CHECK
+-- constraint to include 'paused' via SQLite's standard rebuild dance
+-- (create tasks_new, copy rows, drop tasks, rename). That rebuild's
+-- `CREATE TABLE tasks_new` and its INSERT-SELECT column list
+-- accidentally OMITTED `time_estimate_minutes` — so on every DB that
+-- has gone through 0006 the column no longer exists, and every write
+-- path that binds it (createTask in src/db/tasks.ts, editTask,
+-- direct-command #dur tags, the button-flow Add Task duration step)
+-- has been failing with:
+--
+--     D1_ERROR: no such column: time_estimate_minutes
+--
+-- The user-visible symptom was the AI's create_task tool returning a
+-- generic failure that the model paraphrased as a "technical hiccup"
+-- while claiming to have noted the task manually. Nothing was
+-- persisted. Same underlying cause hit editTask, the nudger's
+-- duration-aware ranking (task.time_estimate_minutes was always
+-- null-shaped in the row it read back), and the /add-task button
+-- flow.
+--
+-- This migration re-adds the column with the same shape 0003
+-- originally declared: nullable INTEGER, no default. Every existing
+-- row gets NULL, matching the pre-rebuild semantics (task with no
+-- known duration). Fresh writes going forward pick up whatever
+-- normaliseTimeEstimate returned in the caller.
+--
+-- Restoring the column here (rather than doing another rebuild of
+-- tasks to reintroduce it in the exact old position) is deliberate:
+--   * ALTER TABLE ADD COLUMN is O(1) in SQLite and requires no row
+--     rewrite, so a large tasks table stays online.
+--   * The old vs. new column ORDER is irrelevant — every code path
+--     addresses the column by name, never by positional index.
+--   * A second rebuild would risk repeating the same "forgot a
+--     column" mistake against 0007's schedule_constraint and
+--     missed_cycle_key.
+--
+-- No index needed — no query filters or joins on this column; the
+-- nudge scorer only reads it per-row after tasks are already
+-- narrowed by (user_id, status).
+
+ALTER TABLE tasks ADD COLUMN time_estimate_minutes INTEGER;

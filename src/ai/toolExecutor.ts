@@ -163,18 +163,43 @@ async function handleCreate(env: Env, userId: number, args: Record<string, unkno
     return { name: 'create_task', response: { ok: false, error: constraint.error } };
   }
 
-  const task = await createTask(env.DB, {
-    user_id: userId,
-    title,
-    priority: priorityArg,
-    context_note: (args.context_note as string) ?? null,
-    scheduled_for: (args.scheduled_for as string) ?? null,
-    is_recurring: !!args.is_recurring,
-    recurrence_rule: rule ?? null,
-    time_estimate_minutes: parseTimeEstimateArg(args.time_estimate_minutes),
-    schedule_constraint: constraint.value,
-  });
-  return { name: 'create_task', response: { ok: true, task: decorateTask(task) } };
+  // We catch the createTask write specifically so a thrown D1 error
+  // (schema drift, constraint violation, whatever) is surfaced to
+  // the model as a structured tool-result — the same {ok:false,error}
+  // shape every validation branch above uses — with a hint that
+  // explicitly forbids the model from claiming the task was saved.
+  // Prior behaviour: the outer executeTool catch also returned
+  // {ok:false,error}, but the error string was a raw D1 dump
+  // ("D1_ERROR: no such column: ...") that the model tended to
+  // paraphrase as a vague "technical hiccup, I noted it manually" —
+  // i.e. lie to the user that the task existed. The `saved: false`
+  // flag and the hint make it unambiguous.
+  try {
+    const task = await createTask(env.DB, {
+      user_id: userId,
+      title,
+      priority: priorityArg,
+      context_note: (args.context_note as string) ?? null,
+      scheduled_for: (args.scheduled_for as string) ?? null,
+      is_recurring: !!args.is_recurring,
+      recurrence_rule: rule ?? null,
+      time_estimate_minutes: parseTimeEstimateArg(args.time_estimate_minutes),
+      schedule_constraint: constraint.value,
+    });
+    return { name: 'create_task', response: { ok: true, task: decorateTask(task) } };
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    log.error('create_task_write_failed', { userId, title, message });
+    return {
+      name: 'create_task',
+      response: {
+        ok: false,
+        saved: false,
+        error: `Database write failed while creating task "${title}": ${message}`,
+        hint: 'The task was NOT saved. Tell the user the create failed and quote the error verbatim — do not claim to have noted it manually.',
+      },
+    };
+  }
 }
 
 async function handleUpdateStatus(env: Env, userId: number, args: Record<string, unknown>): Promise<ToolResult> {
