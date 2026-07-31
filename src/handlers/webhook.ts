@@ -4,7 +4,10 @@
 import type { Env } from '../types/env';
 import type { TelegramUpdate, TelegramMessage, TelegramCallbackQuery } from '../types/telegram';
 import { sendMessage, sendChatAction, getFileMeta, downloadFile, answerCallbackQuery } from '../services/telegram';
-import { upsertUser, getUserTimezone, setUserTimezone, isValidIanaTimezone } from '../db/users';
+import {
+  upsertUser, getUserTimezone, resolveUserTimezone, setUserTimezone,
+  isValidIanaTimezone,
+} from '../db/users';
 import {
   listTasksByFilter, listAllOpenTasks, listOpenTasks, getTaskById,
 } from '../db/tasks';
@@ -17,6 +20,7 @@ import {
 import { rememberChatId } from '../db/nudge';
 import { parseAmountToCents, formatMoney } from '../utils/money';
 import { priorityIntToLetter, DEFAULT_PRIORITY_INT } from '../utils/priority';
+import { localNow } from '../utils/time';
 import { runAgent } from '../ai/agent';
 import { arrayBufferToBase64 } from '../utils/base64';
 import {
@@ -194,6 +198,7 @@ async function handleSlashCommand(env: Env, msg: TelegramMessage): Promise<boole
         `/finance — balance + debts summary (splits "you owe" vs. "holding for others")\n` +
         `/setbalance <amount> [currency] — overwrite the balance directly\n\n` +
         `Settings:\n` +
+        `/time — the current date & time as I see it, in your timezone (also /now)\n` +
         `/timezone <IANA tz> — set your timezone, e.g. Africa/Lagos (also /tz)\n` +
         `/reset — wipe all your data and start fresh (asks to confirm)\n\n` +
         `Prefer buttons? /menu opens a keyboard for Tasks, Finance, and Settings — including\n` +
@@ -423,6 +428,31 @@ async function handleSlashCommand(env: Env, msg: TelegramMessage): Promise<boole
       return true;
     }
 
+    case '/time':
+    case '/now': {
+      // Direct read of the exact clock reading the AI is handed every
+      // turn (see ai/systemPrompt.ts "Current context"). Exists so the
+      // user can verify what Compass thinks "now" is without spending
+      // Gemini quota to ask it — and so a wrong answer is immediately
+      // traceable to a wrong timezone rather than to the model.
+      const { timezone, isExplicit } =
+        await resolveUserTimezone(env.DB, userId, env.DEFAULT_TIMEZONE);
+      const clock = localNow(new Date(), timezone);
+      const lines = [
+        `${clock.weekdayLong}, ${clock.date} — ${clock.clock} (${clock.partOfDay})`,
+        `${timezone} (UTC${clock.offset})`,
+      ];
+      if (!isExplicit) {
+        lines.push(
+          ``,
+          `Heads up: you haven't set a timezone, so that's the server default (${timezone}).`,
+          `Set yours with /timezone <IANA tz> — e.g. /timezone Africa/Lagos — so my clock, your "today" list, and free-time nudges line up with your actual day.`,
+        );
+      }
+      await sendMessage(env, msg.chat.id, lines.join('\n'));
+      return true;
+    }
+
     case '/timezone':
     case '/tz': {
       // Usage: /timezone <IANA tz name>
@@ -431,9 +461,16 @@ async function handleSlashCommand(env: Env, msg: TelegramMessage): Promise<boole
       // meant it. Rejects anything that isn't a real IANA identifier
       // so the daily-rollover logic that reads this column stays sane.
       if (!argStr) {
-        const current = await getUserTimezone(env.DB, userId, env.DEFAULT_TIMEZONE);
+        // Show the resulting clock alongside the identifier — a zone
+        // name alone doesn't tell the user whether it's the RIGHT one,
+        // but a wrong wall-clock time does.
+        const { timezone: current, isExplicit } =
+          await resolveUserTimezone(env.DB, userId, env.DEFAULT_TIMEZONE);
+        const clock = localNow(new Date(), current);
         await sendMessage(env, msg.chat.id,
-          `Usage: /timezone <IANA tz name>\nExample: /timezone America/New_York\nExample: /timezone Africa/Lagos\n\nCurrent: ${current}`);
+          `Usage: /timezone <IANA tz name>\nExample: /timezone America/New_York\nExample: /timezone Africa/Lagos\n\n` +
+          `Current: ${current}${isExplicit ? '' : ' (server default — not set by you)'}\n` +
+          `That makes it ${clock.clock} on ${clock.weekdayLong} for you right now.`);
         return true;
       }
       // Take only the first whitespace-separated token — timezone
@@ -447,10 +484,14 @@ async function handleSlashCommand(env: Env, msg: TelegramMessage): Promise<boole
       }
       const before = await getUserTimezone(env.DB, userId, env.DEFAULT_TIMEZONE);
       const after = await setUserTimezone(env.DB, userId, candidate);
+      // Echo the new wall clock so a mis-picked zone is obvious at
+      // once, while the user is still in the settings mindset.
+      const clock = localNow(new Date(), after);
       await sendMessage(env, msg.chat.id,
-        before === after
+        (before === after
           ? `Timezone stays ${after}.`
-          : `Timezone set: ${before} → ${after}`,
+          : `Timezone set: ${before} → ${after}`)
+        + `\nIt's ${clock.clock} on ${clock.weekdayLong} for you right now.`,
       );
       return true;
     }
