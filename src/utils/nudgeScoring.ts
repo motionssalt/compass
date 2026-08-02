@@ -40,6 +40,7 @@ import {
   isConstraintSatisfied,
   safeParseStoredConstraint,
 } from './scheduleConstraint';
+import { urgencyBoost } from './urgency';
 
 /** Tasks whose duration exceeds the window by more than this are unfit. */
 const OVERRUN_TOLERANCE_MINUTES = 5;
@@ -141,12 +142,18 @@ export function scoreTaskForWindow(
     }
   }
 
+  // Urgency: tasks with an imminent or overdue deadline get a
+  // bonus so they surface before an otherwise-equal task with
+  // no deadline.  urgencyBoost returns 0 for 'far'/'none' so
+  // tasks without a deadline are unaffected.
+  const urgBoost = urgencyBoost(task, now);
+
   const score = fits
-    ? fitScore + priorityScore + ageScore + fairnessPenalty
+    ? fitScore + priorityScore + ageScore + fairnessPenalty + urgBoost
     : -1000; // Effectively excluded.
 
   const reason = fits
-    ? `pr=${prInt} age=${ageDays.toFixed(1)}d fit=${fitScore.toFixed(0)} fair=${fairnessPenalty.toFixed(0)}`
+    ? `pr=${prInt} age=${ageDays.toFixed(1)}d fit=${fitScore.toFixed(0)} fair=${fairnessPenalty.toFixed(0)} urg=${urgBoost}`
     : `overruns window (est=${est}min > ${available}min)`;
 
   return { task, score, fits, reason };
@@ -169,9 +176,25 @@ export function pickNudgeTask(
 ): ScoredTask | null {
   if (window.isBusy || window.minutesAvailable === null) return null;
 
+  // Build a set of all open task ids for fast dependency checking.
+  const openIds = new Set(openTasks.map((t) => t.id));
+  // Build a set of task ids that are parents of at least one open subtask,
+  // so we can skip nudging the parent and nudge the subtask instead.
+  const openParentIds = new Set(
+    openTasks
+      .filter((t) => t.parent_task_id != null && openIds.has(t.parent_task_id))
+      .map((t) => t.parent_task_id as number),
+  );
+
   const flexible = openTasks
     .filter(isFlexibleTask)
-    .filter((t) => isConstraintEligibleNow(t, now, timezone));
+    .filter((t) => isConstraintEligibleNow(t, now, timezone))
+    // Skip tasks blocked by an open dependency: the dependency must be
+    // cleared first before we nudge the blocked task.
+    .filter((t) => t.depends_on_task_id == null || !openIds.has(t.depends_on_task_id))
+    // Skip parents that still have open subtasks: nudge the subtask instead
+    // so the user makes progress on the work rather than the wrapper.
+    .filter((t) => !openParentIds.has(t.id));
   if (flexible.length === 0) return null;
 
   const scored = flexible
