@@ -5,6 +5,7 @@ import { formatMoney } from '../utils/money';
 import { priorityIntToLetter } from '../utils/priority';
 import { localNow } from '../utils/time';
 import { safeParseStoredConstraint } from '../utils/scheduleConstraint';
+import { urgencyLabel } from '../utils/urgency';
 
 /**
  * Compact, human-readable rendering of a stored SchedulingConstraint
@@ -88,6 +89,10 @@ export function buildSystemPrompt(params: {
         );
         if (windowSummary) bits.push(`window=${windowSummary}`);
         if (t.context_note) bits.push(`note="${t.context_note}"`);
+        if (t.depends_on_task_id) bits.push(`depends_on=#${t.depends_on_task_id}`);
+        if (t.parent_task_id) bits.push(`parent=#${t.parent_task_id}`);
+        const urg = urgencyLabel(t, now);
+        if (urg) bits.push(`urgency=${urg}`);
         return `- ${bits.join(' | ')}`;
       }).join('\n')
     : '(no open tasks right now)';
