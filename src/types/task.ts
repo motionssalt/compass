@@ -55,6 +55,24 @@ export interface Task {
    * NEVER affects the following occurrence.
    */
   missed_cycle_key: string | null;
+  /**
+   * Soft, INFORMATIONAL dependency pointer — "this task can't
+   * reasonably start until #depends_on_task_id is done". Nothing in
+   * the write path blocks on it; the AI's nudger and the system
+   * prompt consult it to shape recommendations (avoid suggesting a
+   * dependent while its dependency is still open) and task listings
+   * surface it. See migrations/0009_task_relationships.sql.
+   */
+  depends_on_task_id: number | null;
+  /**
+   * Hard, blocking parent pointer for parent/subtask relationships.
+   * When set, the row is a SUBTASK of #parent_task_id. A parent row
+   * cannot transition to status='done' while any of its subtasks is
+   * still open (pending / in_progress / paused) — the gate lives in
+   * src/db/tasks.updateTaskStatus so every write path (AI tool,
+   * direct command, button flow) inherits it from the same place.
+   */
+  parent_task_id: number | null;
   created_at: string;
   updated_at: string;
 }
