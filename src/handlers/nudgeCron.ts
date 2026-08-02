@@ -42,6 +42,7 @@ import {
   cycleKeyForNow,
 } from '../utils/scheduleConstraint';
 import { priorityIntToLetter, DEFAULT_PRIORITY_INT } from '../utils/priority';
+import { urgencyLabel } from '../utils/urgency';
 import { sendMessage } from '../services/telegram';
 import { log } from '../utils/logger';
 
@@ -106,7 +107,7 @@ export async function handleNudgeCron(env: Env): Promise<void> {
         continue;
       }
 
-      const message = formatNudgeMessage(pick.task, window.minutesAvailable!);
+      const message = formatNudgeMessage(pick.task, window.minutesAvailable!, now);
       await sendMessage(env, state.chat_id, message);
       await recordNudge(env.DB, u.user_id, window.signature, pick.task.id);
       nudged++;
@@ -199,17 +200,23 @@ function safeParseRule(json: string): RecurrenceRule | null {
   }
 }
 
-function formatNudgeMessage(task: { id: number; title: string; priority: number; time_estimate_minutes: number | null }, windowMinutes: number): string {
+function formatNudgeMessage(
+  task: Task,
+  windowMinutes: number,
+  now: Date,
+): string {
   const grade = task.priority && task.priority !== DEFAULT_PRIORITY_INT
     ? ` (${priorityIntToLetter(task.priority)})`
     : '';
   const est = task.time_estimate_minutes && task.time_estimate_minutes > 0
     ? ` — ~${task.time_estimate_minutes}min`
     : '';
+  const urg = urgencyLabel(task, now);
+  const urgPart = urg ? ` [${urg}]` : '';
   const window = `~${windowMinutes}min free`;
   return (
     `Small gap? ${window}.\n` +
-    `• #${task.id} ${task.title}${grade}${est}\n` +
+    `• #${task.id} ${task.title}${grade}${est}${urgPart}\n` +
     `No pressure — just a nudge.`
   );
 }
