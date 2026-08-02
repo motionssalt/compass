@@ -8,7 +8,7 @@
 //
 // Batch entry syntax (one task per line):
 //
-//     Title text | priority=B+ | dur=45 | when=morning | note=foo | constraint=days:mon,wed;time:07:00-08:00
+//     Title text | priority=B+ | dur=45 | when=morning | note=foo | constraint=days:mon,wed;time:07:00-08:00 | depends=3 | parent=7
 //
 // Only the title is required. Recognised tags (case-insensitive,
 // order irrelevant, `|` separates them from each other and from the
@@ -19,6 +19,10 @@
 //   when=      or  sched=  or  at=      loose text or ISO datetime
 //   note=      or  ctx=                  free-text context
 //   constraint= or window= or c=        scheduling constraint (see below)
+//   depends=   or  dep=  or  depends_on=  or  blocked_by=  or  after=
+//                             id of a task this one depends on
+//   parent=    or  sub_of=  or  subof=  or  subtask_of=
+//                             id of a parent task (makes this a subtask)
 //
 // A `#` at the start of a line is a comment. Blank lines are
 // skipped. Any line that starts with `-` or `•` has that bullet
@@ -37,14 +41,16 @@
 // side of `dates:` may be a `-` or empty for an open-ended range.
 // The literal values `none`, `clear`, `off`, or an empty value
 // remove any existing constraint. On `/addtask` an omitted or empty
-// `constraint=` means \"no constraint\" (the default).
+// `constraint=` means "no constraint" (the default).
 
 import type { Env } from '../types/env';
 import type { RecurrenceRule, SchedulingConstraint } from '../types/shared';
 import type { Task, TaskStatus } from '../types/task';
 import {
   createTask, editTask, getTaskById, listOpenTasks, updateTaskStatus,
+  listSubtasks,
   parseScheduleConstraint, safeParseStoredConstraint,
+  ParentHasOpenSubtasksError,
   type CreateTaskInput, type EditFields,
 } from '../db/tasks';
 import { sendMessage } from '../services/telegram';
@@ -53,6 +59,27 @@ import {
   comparePriorityInt,
 } from '../utils/priority';
 import { isFlexibleTask } from '../utils/nudgeScoring';
+import { urgencyLabel } from '../utils/urgency';
+
+// ---------------------------------------------------------------
+// Shared helper: parent-has-open-subtasks gate message
+//
+// Shared across the direct-command path (cmdEditTask, cmdFinishTask,
+// etc.) and the button path (buttons.ts) so the user always sees the
+// same phrasing regardless of how they triggered the write. Callers
+// catch ParentHasOpenSubtasksError and forward .parentId /
+// .openSubtaskIds here.
+// ---------------------------------------------------------------
+
+export function subtaskGateMessage(parentId: number, openSubtaskIds: number[]): string {
+  const ids = openSubtaskIds.map((n) => `#${n}`).join(', ');
+  const count = openSubtaskIds.length;
+  return (
+    `Can't mark #${parentId} done — it still has ` +
+    `${count} open subtask${count === 1 ? '' : 's'}: ${ids}.\n` +
+    `Finish or cancel those first, then mark the parent done.`
+  );
+}
 
 // ---------------------------------------------------------------
 // Public entry points — one per slash command.
@@ -66,8 +93,9 @@ export async function cmdAddTask(
 ): Promise<string> {
   if (!argStr.trim()) {
     return (
-      `Usage: /addtask <title> [| priority=B+] [| dur=45] [| when=morning] [| note=...] [| constraint=days:mon,wed;time:07:00-08:00]\n` +
-      `Example: /addtask Draft the report | p=A | dur=90 | when=this afternoon`
+      `Usage: /addtask <title> [| priority=B+] [| dur=45] [| when=morning] [| note=...] [| constraint=days:mon,wed;time:07:00-08:00] [| depends=<id>] [| parent=<id>]\n` +
+      `Example: /addtask Draft the report | p=A | dur=90 | when=this afternoon\n` +
+      `Example: /addtask Write intro | parent=5`
     );
   }
   const parsed = parseTaskLine(argStr);
@@ -77,7 +105,7 @@ export async function cmdAddTask(
     user_id: userId,
     ...parsed.input,
   });
-  return `Added: ${formatTaskLine(task)}`;
+  return `Added: ${formatTaskLine(task, new Date())}`;
 }
 
 export async function cmdAddBatch(
@@ -89,7 +117,7 @@ export async function cmdAddBatch(
       `Example:\n` +
       `/addbatch\n` +
       `Draft report | p=A | dur=90\n` +
-      `Reply to Sam | p=B+ | dur=10\n` +
+      `Reply to Sam | p=B+ | dur=10 | depends=1\n` +
       `- Fold laundry | p=C-`
     );
   }
@@ -98,6 +126,7 @@ export async function cmdAddBatch(
   const created: Task[] = [];
   const errors: string[] = [];
   let lineNum = 0;
+  const now = new Date();
 
   for (const raw of lines) {
     lineNum++;
@@ -124,7 +153,7 @@ export async function cmdAddBatch(
   const parts: string[] = [];
   if (created.length > 0) {
     parts.push(`Added ${created.length} task${created.length === 1 ? '' : 's'}:`);
-    for (const t of created) parts.push(formatTaskLine(t));
+    for (const t of created) parts.push(formatTaskLine(t, now));
   } else {
     parts.push(`No tasks added.`);
   }
@@ -142,14 +171,13 @@ export async function cmdEditTask(
   if (!argStr.trim()) {
     return (
       `Usage: /edittask <id> field=value [| field=value ...]\n` +
-      `Fields: title, priority (A+..E-), dur (minutes), when, note, status (pending|in_progress|paused|done|cancelled), constraint (see /schedule)\n` +
+      `Fields: title, priority (A+..E-), dur (minutes), when, note, status (pending|in_progress|paused|done|cancelled), constraint (see /schedule), depends=<id> (or clear), parent=<id> (or clear)\n` +
       `Example: /edittask 12 | p=A- | dur=30 | when=tonight\n` +
-      `Example: /edittask 12 | constraint=days:mon,wed,fri;time:07:00-08:00`
+      `Example: /edittask 12 | depends=5 | parent=3\n` +
+      `Example: /edittask 12 | depends=clear | parent=clear`
     );
   }
 
-  // Grab the leading id, everything after is the pipe-separated field
-  // list (with an optional leading `|`).
   const m = /^\s*#?(\d+)\s*\|?\s*(.*)$/s.exec(argStr);
   if (!m) return `Couldn't read a task id from "${argStr.slice(0, 40)}".`;
   const id = parseInt(m[1], 10);
@@ -165,9 +193,66 @@ export async function cmdEditTask(
     return `Nothing to change. Give me at least one field, e.g. "/edittask ${id} | p=A".`;
   }
 
-  const updated = await editTask(env.DB, userId, id, parsed.fields);
+  let updated: Task | null;
+  try {
+    updated = await editTask(env.DB, userId, id, parsed.fields);
+  } catch (err) {
+    if (err instanceof ParentHasOpenSubtasksError) {
+      return subtaskGateMessage(err.parentId, err.openSubtaskIds);
+    }
+    throw err;
+  }
   if (!updated) return `No task #${id}.`;
-  return `Updated: ${formatTaskLine(updated)}`;
+  return `Updated: ${formatTaskLine(updated, new Date())}`;
+}
+
+/**
+ * /subtask <parent_id> <title> [| tag=value ...]
+ *
+ * Convenience shorthand for adding a subtask under an existing task.
+ * Routes through the SAME createTask helper /addtask uses — no forked
+ * logic — with parent_task_id pre-filled. The title is everything
+ * after the parent id up to the first `|`, so the user doesn't have
+ * to type `| parent=<id>` explicitly.
+ *
+ * Examples:
+ *   /subtask 5 Write intro section
+ *   /subtask 5 Write intro section | p=B | dur=30
+ */
+export async function cmdSubtask(
+  env: Env, userId: number, argStr: string,
+): Promise<string> {
+  if (!argStr.trim()) {
+    return (
+      `Usage: /subtask <parent_id> <title> [| p=B] [| dur=30] [| ...]\n` +
+      `Adds a subtask under an existing task. Same field syntax as /addtask.\n` +
+      `Example: /subtask 5 Write intro section | p=B | dur=30`
+    );
+  }
+
+  const m = /^\s*#?(\d+)\s+(.+)$/s.exec(argStr);
+  if (!m) {
+    return (
+      `Couldn't read a parent id and title. ` +
+      `Usage: /subtask <parent_id> <title> [| p=B] [| dur=30]`
+    );
+  }
+  const parentId = parseInt(m[1], 10);
+  const rest = m[2].trim();
+  if (!Number.isFinite(parentId) || parentId <= 0) return `Invalid parent task id.`;
+
+  const parent = await getTaskById(env.DB, userId, parentId);
+  if (!parent) return `No task #${parentId}.`;
+
+  const parsed = parseTaskLine(rest);
+  if (!parsed.ok) return `Couldn't add subtask: ${parsed.error}`;
+
+  const task = await createTask(env.DB, {
+    user_id: userId,
+    ...parsed.input,
+    parent_task_id: parentId,
+  });
+  return `Added subtask under #${parentId} "${parent.title}":\n${formatTaskLine(task, new Date())}`;
 }
 
 /**
@@ -205,8 +290,6 @@ export async function cmdSchedule(
     );
   }
 
-  // Parse "<id> <rest>" — the id is the first whitespace-separated
-  // token; everything after is the constraint expression.
   const m = /^\s*#?(\d+)\s*(.*)$/s.exec(argStr);
   if (!m) return `Couldn't read a task id from "${argStr.slice(0, 40)}".`;
   const id = parseInt(m[1], 10);
@@ -216,7 +299,6 @@ export async function cmdSchedule(
   const existing = await getTaskById(env.DB, userId, id);
   if (!existing) return `No task #${id}.`;
 
-  // Bare "/schedule <id>" — show the current constraint.
   if (!rest) {
     const current = safeParseStoredConstraint(existing.schedule_constraint);
     const summary = formatConstraint(current);
@@ -237,17 +319,17 @@ export async function cmdSchedule(
   if (!updated) return `No task #${id}.`;
 
   const summary = formatConstraint(safeParseStoredConstraint(updated.schedule_constraint));
-  return `Updated: ${formatTaskLine(updated)}\nConstraint: ${summary}`;
+  return `Updated: ${formatTaskLine(updated, new Date())}\nConstraint: ${summary}`;
 }
 
 export async function cmdReviewFlexible(
   env: Env, userId: number,
 ): Promise<string> {
   const open = await listOpenTasks(env.DB, userId);
+  const now = new Date();
   const flexible = open
     .filter(isFlexibleTask)
     .sort((a, b) => {
-      // Part-1 letter-grade sort: lower integer = higher priority.
       const p = comparePriorityInt(a.priority, b.priority);
       if (p !== 0) return p;
       return a.created_at.localeCompare(b.created_at);
@@ -256,7 +338,7 @@ export async function cmdReviewFlexible(
   if (flexible.length === 0) {
     return `No open flexible tasks. Everything on the list either has a hard time or is already in progress.`;
   }
-  return `Flexible tasks (highest priority first):\n${flexible.map(formatTaskLine).join('\n')}`;
+  return `Flexible tasks (highest priority first):\n${flexible.map((t) => formatTaskLine(t, now)).join('\n')}`;
 }
 
 // ---------------------------------------------------------------
@@ -293,7 +375,15 @@ async function statusOnlyCommand(
   if (existing.status === targetStatus) {
     return `Task #${id} is already ${targetStatus}.`;
   }
-  const updated = await updateTaskStatus(env.DB, userId, id, targetStatus);
+  let updated: Task | null;
+  try {
+    updated = await updateTaskStatus(env.DB, userId, id, targetStatus);
+  } catch (err) {
+    if (err instanceof ParentHasOpenSubtasksError) {
+      return subtaskGateMessage(err.parentId, err.openSubtaskIds);
+    }
+    throw err;
+  }
   if (!updated) return `No task #${id}.`;
   return formatMsg(updated);
 }
@@ -303,7 +393,7 @@ export async function cmdPauseTask(
 ): Promise<string> {
   return statusOnlyCommand(env, userId, argStr, 'paused',
     `Usage: /pause <id>\nPauses a task — still visible in your lists, but skipped by the free-time nudger and by "what's active now".`,
-    (t) => `Paused: ${formatTaskLine(t)}`,
+    (t) => `Paused: ${formatTaskLine(t, new Date())}`,
   );
 }
 
@@ -312,7 +402,7 @@ export async function cmdResumeTask(
 ): Promise<string> {
   return statusOnlyCommand(env, userId, argStr, 'pending',
     `Usage: /resume <id>\nUnpauses a task — back in the pool for free-time nudges.`,
-    (t) => `Resumed: ${formatTaskLine(t)}`,
+    (t) => `Resumed: ${formatTaskLine(t, new Date())}`,
   );
 }
 
@@ -321,7 +411,7 @@ export async function cmdStartTask(
 ): Promise<string> {
   return statusOnlyCommand(env, userId, argStr, 'in_progress',
     `Usage: /starttask <id>\nMarks a task as active right now.`,
-    (t) => `Started: ${formatTaskLine(t)}`,
+    (t) => `Started: ${formatTaskLine(t, new Date())}`,
   );
 }
 
@@ -330,7 +420,7 @@ export async function cmdFinishTask(
 ): Promise<string> {
   return statusOnlyCommand(env, userId, argStr, 'done',
     `Usage: /finishtask <id>\nMarks a task as done.`,
-    (t) => `Finished: ${formatTaskLine(t)}`,
+    (t) => `Finished: ${formatTaskLine(t, new Date())}`,
   );
 }
 
@@ -369,6 +459,12 @@ function parseTaskLine(line: string): ParseTaskOk | ParseFail {
   if (parsedTags.fields.schedule_constraint !== undefined) {
     input.schedule_constraint = parsedTags.fields.schedule_constraint;
   }
+  if (parsedTags.fields.depends_on_task_id !== undefined) {
+    input.depends_on_task_id = parsedTags.fields.depends_on_task_id;
+  }
+  if (parsedTags.fields.parent_task_id !== undefined) {
+    input.parent_task_id = parsedTags.fields.parent_task_id;
+  }
   return { ok: true, input };
 }
 
@@ -393,6 +489,14 @@ function parseEditFields(rest: string): ParseEditOk | ParseFail {
   if (parsedTags.fields.schedule_constraint !== undefined) {
     fields.schedule_constraint = parsedTags.fields.schedule_constraint;
   }
+  // Relationship pointers — undefined means "leave alone"; null means "clear";
+  // a number means "set/replace". Both interpretations come from parseTagList.
+  if ('depends_on_task_id' in parsedTags.fields) {
+    fields.depends_on_task_id = parsedTags.fields.depends_on_task_id;
+  }
+  if ('parent_task_id' in parsedTags.fields) {
+    fields.parent_task_id = parsedTags.fields.parent_task_id;
+  }
   return { ok: true, fields };
 }
 
@@ -412,6 +516,15 @@ interface ParsedTagFields {
    * clear any existing constraint.
    */
   schedule_constraint?: SchedulingConstraint | null;
+  /**
+   * Relationship pointers: `undefined` = absent (don't touch on edit);
+   * `null` = explicitly clear; `number` = set/replace. The key is
+   * present in the fields object only when the tag appeared in the
+   * input — callers should use `'key' in fields` to distinguish
+   * "not present" from `undefined`.
+   */
+  depends_on_task_id?: number | null;
+  parent_task_id?: number | null;
 }
 interface ParseTagsOk { ok: true; fields: ParsedTagFields }
 
@@ -428,12 +541,16 @@ function parseTagList(
     }
     const key = tag.slice(0, eq).trim().toLowerCase();
     const value = tag.slice(eq + 1).trim();
-    // Constraint tag is special: a bare `constraint=` (empty value)
-    // is meaningful — it clears the field. Every other tag still
-    // requires a non-empty value.
     const isConstraintKey =
       key === 'constraint' || key === 'window' || key === 'c';
-    if (!value && !isConstraintKey) return { ok: false, error: `empty value for "${key}"` };
+    // Relationship tags: allow empty/clear values to mean "remove link".
+    const isRelationKey =
+      key === 'depends' || key === 'dep' || key === 'depends_on' ||
+      key === 'blocked_by' || key === 'after' ||
+      key === 'parent' || key === 'sub_of' || key === 'subof' || key === 'subtask_of';
+    if (!value && !isConstraintKey && !isRelationKey) {
+      return { ok: false, error: `empty value for "${key}"` };
+    }
 
     switch (key) {
       case 'title':
@@ -463,8 +580,6 @@ function parseTagList(
       case 'sched':
       case 'scheduled':
       case 'at': {
-        // Loose text passthrough — matches how scheduled_for is
-        // stored throughout the codebase.
         fields.scheduled_for = value;
         break;
       }
@@ -486,14 +601,44 @@ function parseTagList(
       case 'constraint':
       case 'window':
       case 'c': {
-        // Same mini-syntax as /schedule. Routes through the SAME
-        // parseScheduleConstraint that validates every other write
-        // path (AI tool, button flow) — no forked logic.
         const parsed = parseConstraintExpression(value);
         if (!parsed.ok) {
           return { ok: false, error: `constraint: ${parsed.error}` };
         }
         fields.schedule_constraint = parsed.value;
+        break;
+      }
+      // Dependency pointer: depends= / dep= / depends_on= / blocked_by= / after=
+      case 'depends':
+      case 'dep':
+      case 'depends_on':
+      case 'blocked_by':
+      case 'after': {
+        if (!value || /^(clear|none|off|-)$/i.test(value)) {
+          fields.depends_on_task_id = null;
+        } else {
+          const n = parseInt(value, 10);
+          if (!Number.isFinite(n) || n <= 0) {
+            return { ok: false, error: `depends= must be a positive task id or "clear", got "${value}"` };
+          }
+          fields.depends_on_task_id = n;
+        }
+        break;
+      }
+      // Parent pointer: parent= / sub_of= / subof= / subtask_of=
+      case 'parent':
+      case 'sub_of':
+      case 'subof':
+      case 'subtask_of': {
+        if (!value || /^(clear|none|off|-)$/i.test(value)) {
+          fields.parent_task_id = null;
+        } else {
+          const n = parseInt(value, 10);
+          if (!Number.isFinite(n) || n <= 0) {
+            return { ok: false, error: `parent= must be a positive task id or "clear", got "${value}"` };
+          }
+          fields.parent_task_id = n;
+        }
         break;
       }
       default:
@@ -539,36 +684,12 @@ function parseDurationMinutes(v: string): number | null {
 // ---------------------------------------------------------------
 // Scheduling-constraint mini-syntax
 // ---------------------------------------------------------------
-//
-// Compact, human-writable expression that maps to the same
-// SchedulingConstraint shape the AI tools and the button flow
-// produce. Everything eventually funnels through
-// parseScheduleConstraint (src/utils/scheduleConstraint.ts) — this
-// function only tokenises the string form, it never validates the
-// semantic constraints itself.
-//
-// Grammar (informal):
-//   expr    := "clear" | "none" | "off" | ""    -> null (clear)
-//            | pair (SEP pair)*
-//   pair    := "dates:" range
-//            | "days:"  daycsv
-//            | "time:"  timerange
-//   SEP     := ";" or "|" or ","-around-a-pair-boundary
-//
-// The parser is intentionally forgiving: separators can be `;` or
-// `|`, whitespace is tolerated everywhere, and sub-keys are
-// case-insensitive.
 
 export interface ParseConstraintOk {
   ok: true;
   value: SchedulingConstraint | null;
 }
 
-/**
- * Turn a mini-syntax expression into a validated SchedulingConstraint
- * (or null to clear). Exported so the button flow's free-text follow-
- * up paths can share the exact same parser.
- */
 export function parseConstraintExpression(
   expr: string,
 ): ParseConstraintOk | ParseFail {
@@ -579,7 +700,6 @@ export function parseConstraintExpression(
     return { ok: true, value: null };
   }
 
-  // Split on `;` or `|` — either separator works. Trim empties.
   const pairs = trimmed.split(/[;|]/).map((s) => s.trim()).filter((s) => s.length > 0);
 
   const obj: Record<string, unknown> = {};
@@ -608,9 +728,6 @@ export function parseConstraintExpression(
     }
   }
 
-  // Delegate final shape validation (empties, day dedup, min/max
-  // ordering, HH:MM sanity, YYYY-MM-DD sanity) to the ONE place
-  // that owns it.
   const parsed = parseScheduleConstraint(obj);
   if (!parsed.ok) return { ok: false, error: parsed.error };
   return { ok: true, value: parsed.constraint };
@@ -619,10 +736,6 @@ export function parseConstraintExpression(
 function parseDateRange(
   value: string,
 ): { ok: true; value: { start?: string; end?: string } } | ParseFail {
-  // Accept "YYYY-MM-DD..YYYY-MM-DD" (canonical), or a single
-  // "YYYY-MM-DD" (both sides equal to that), or "..YYYY-MM-DD" /
-  // "YYYY-MM-DD.." for open-ended. Either side may be "-" for "no
-  // bound on that side".
   const v = value.trim();
   if (!v) return { ok: false, error: `dates: empty range` };
   const parts = v.split('..');
@@ -649,7 +762,6 @@ function parseDaysList(
 ): { ok: true; value: string[] } | ParseFail {
   const raw = value.trim();
   if (!raw) return { ok: false, error: `days: empty` };
-  // Accept comma OR whitespace as separator.
   const parts = raw.split(/[,\s]+/).map((s) => s.trim()).filter((s) => s.length > 0);
   return { ok: true, value: parts };
 }
@@ -659,8 +771,7 @@ function parseTimeWindow(
 ): { ok: true; value: { start: string; end: string } } | ParseFail {
   const raw = value.trim();
   if (!raw) return { ok: false, error: `time: empty` };
-  // Accept "HH:MM-HH:MM" or "HH:MM..HH:MM".
-  const m = /^(\d{1,2}:\d{2})\s*(?:-|\.\.|to|—)\s*(\d{1,2}:\d{2})$/i.exec(raw);
+  const m = /^(\d{1,2}:\d{2})\s*(?:-|\.\.| to |—)\s*(\d{1,2}:\d{2})$/i.exec(raw);
   if (!m) {
     return { ok: false, error: `time: expected HH:MM-HH:MM, got "${raw}"` };
   }
@@ -668,10 +779,22 @@ function parseTimeWindow(
 }
 
 // ---------------------------------------------------------------
-// Formatting
+// Formatting — exported so buttons.ts can reuse them
 // ---------------------------------------------------------------
 
-function formatTaskLine(t: Task): string {
+/**
+ * Single-line task rendering with relationship glyphs and urgency label.
+ *
+ * Glyphs shown (in this order, all optional):
+ *   ⛓  depends on #N   — dependency pointer
+ *   ↳  subtask of #N   — parent pointer
+ *   ⏳  urgency label   — from utils/urgency.ts; NEVER touches stored priority
+ *
+ * `now` is passed in rather than read here so the caller (nudgeCron,
+ * formatNudgeMessage, etc.) controls the clock snapshot — no silent
+ * Date() calls inside a formatter.
+ */
+export function formatTaskLine(t: Task, now: Date): string {
   const bits = [`#${t.id} ${t.title}`];
   if (t.priority && t.priority !== DEFAULT_PRIORITY_INT) {
     bits.push(`(${priorityIntToLetter(t.priority)})`);
@@ -686,17 +809,72 @@ function formatTaskLine(t: Task): string {
     if (summary) bits.push(`⟨${summary}⟩`);
   }
   if (t.status !== 'pending') bits.push(`[${t.status}]`);
+
+  // Relationship glyphs — come last so they don't clutter the
+  // core title/priority reading.
+  if (t.depends_on_task_id != null) {
+    bits.push(`⛓ depends=#${t.depends_on_task_id}`);
+  }
+  if (t.parent_task_id != null) {
+    bits.push(`↳ subtask-of #${t.parent_task_id}`);
+  }
+
+  // Urgency label — overlay only, never modifies stored priority.
+  const urg = urgencyLabel(t, now);
+  if (urg) bits.push(`⏳ ${urg}`);
+
   return `• ${bits.join(' ')}`;
 }
 
 /**
+ * Render a task list grouping in-list subtasks under their parent
+ * with indentation. Tasks that appear as children of another task in
+ * the same list are indented two spaces under the parent row; orphan
+ * subtasks (whose parent isn't in the list) render as top-level items.
+ *
+ * The ordering contract: top-level items keep the input order; a
+ * parent's children are inserted immediately after it in the order
+ * they appear in `tasks`. This makes the function stable for both
+ * the /alltasks view and any caller that pre-sorts by priority.
+ */
+export function renderTaskList(tasks: Task[], now: Date): string {
+  if (tasks.length === 0) return '(none)';
+
+  // Build a quick id→task map and a set of ids in this list.
+  const byId = new Map<number, Task>(tasks.map((t) => [t.id, t]));
+
+  // Partition into top-level (no parent, or parent not in list) and children.
+  const children = new Map<number, Task[]>(); // parentId → children
+  const topLevel: Task[] = [];
+
+  for (const t of tasks) {
+    const pid = t.parent_task_id;
+    if (pid != null && byId.has(pid)) {
+      if (!children.has(pid)) children.set(pid, []);
+      children.get(pid)!.push(t);
+    } else {
+      topLevel.push(t);
+    }
+  }
+
+  const lines: string[] = [];
+  for (const t of topLevel) {
+    lines.push(formatTaskLine(t, now));
+    const subs = children.get(t.id);
+    if (subs) {
+      for (const s of subs) {
+        // Indent child lines by replacing the leading bullet with "  ↳".
+        const raw = formatTaskLine(s, now);
+        lines.push(`  ↳${raw.slice(1)}`); // strip the "•", indent
+      }
+    }
+  }
+  return lines.join('\n');
+}
+
+/**
  * Compact single-line rendering of a constraint for inline task
- * listings. Empty when there's nothing to show. Same style as the
- * one in src/ai/systemPrompt.ts#summariseConstraint — kept here as
- * a peer rather than a shared helper because the two formats differ
- * on separators (this one uses commas/semicolons to fit the ⟨…⟩
- * bracket look, the AI one uses spaces to fit the bar-delimited
- * task line).
+ * listings. Empty when there's nothing to show.
  */
 function formatConstraintShort(c: SchedulingConstraint | null): string {
   if (!c) return '';
@@ -713,9 +891,7 @@ function formatConstraintShort(c: SchedulingConstraint | null): string {
 }
 
 /**
- * Multi-line rendering for the /schedule show-current view. Says
- * "none" plainly when the field is null so a bare `/schedule <id>`
- * is a self-contained explanation.
+ * Multi-line rendering for the /schedule show-current view.
  */
 export function formatConstraint(c: SchedulingConstraint | null): string {
   if (!c) return 'none';
