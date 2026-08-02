@@ -44,6 +44,7 @@ export const BOT_COMMANDS: readonly BotCommand[] = [
   { command: 'finishtask', description: 'Mark a task done yourself (also /done)' },
   { command: 'pause',      description: 'Pause a task — kept on the list, skipped by nudges' },
   { command: 'resume',     description: 'Resume a paused task' },
+  { command: 'subtask',    description: 'Add a subtask under an existing task: /subtask <parent_id> <title>' },
   { command: 'review',     description: 'Review flexible / unscheduled tasks (also /flex)' },
   { command: 'setbalance', description: 'Overwrite the balance directly' },
   { command: 'time',       description: 'Show the current date and time in your timezone (also /now)' },
