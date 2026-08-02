@@ -123,6 +123,80 @@ export async function getTaskById(
 }
 
 // ---------------------------------------------------------------
+// Relationship helpers (dependencies + parent/subtask)
+// ---------------------------------------------------------------
+
+/**
+ * Thrown by updateTaskStatus when the caller asks to mark a parent
+ * task 'done' while any subtask is still open. Named subclass rather
+ * than a generic Error so upstream handlers (AI tool executor, direct
+ * slash commands, button flow) can distinguish it from an incidental
+ * D1 failure and surface a friendly, tailored message. The user-
+ * visible copy each caller shows is decided in the caller — this
+ * class just carries the machine-readable payload.
+ */
+export class ParentHasOpenSubtasksError extends Error {
+  constructor(
+    public readonly parentId: number,
+    public readonly openSubtaskIds: number[],
+  ) {
+    super(
+      `Task #${parentId} still has ${openSubtaskIds.length} open subtask`
+      + `${openSubtaskIds.length === 1 ? '' : 's'} `
+      + `(${openSubtaskIds.map((n) => `#${n}`).join(', ')}).`,
+    );
+    this.name = 'ParentHasOpenSubtasksError';
+  }
+}
+
+/**
+ * List subtasks (direct children only, one level) of `parentId` for
+ * `userId`. Ordered the same way listOpenTasks orders open rows so
+ * subtask groupings render consistently.
+ *
+ * Deliberately user-scoped even though every caller already has the
+ * parent's user_id — the same defensive pattern every other single-
+ * scope read in this module uses.
+ */
+export async function listSubtasks(
+  db: D1Database, userId: number, parentId: number,
+): Promise<Task[]> {
+  const { results } = await db.prepare(
+    `SELECT * FROM tasks
+      WHERE user_id = ?1 AND parent_task_id = ?2
+      ORDER BY
+        CASE status
+          WHEN 'in_progress' THEN 0
+          WHEN 'pending'     THEN 1
+          WHEN 'paused'      THEN 2
+          WHEN 'done'        THEN 3
+          WHEN 'cancelled'   THEN 4
+          ELSE 5 END,
+        priority ASC,
+        created_at ASC`,
+  ).bind(userId, parentId).all<Task>();
+  return results ?? [];
+}
+
+/**
+ * Return the OPEN subtask ids for `parentId`. "Open" is the same set
+ * listOpenTasks uses — pending / in_progress / paused. Used by the
+ * updateTaskStatus gate that refuses to mark a parent done while any
+ * subtask is still on the list.
+ */
+export async function listOpenSubtaskIds(
+  db: D1Database, userId: number, parentId: number,
+): Promise<number[]> {
+  const { results } = await db.prepare(
+    `SELECT id FROM tasks
+      WHERE user_id = ?1
+        AND parent_task_id = ?2
+        AND status IN ('pending','in_progress','paused')`,
+  ).bind(userId, parentId).all<{ id: number }>();
+  return (results ?? []).map((r) => r.id);
+}
+
+// ---------------------------------------------------------------
 // Write
 // ---------------------------------------------------------------
 
@@ -144,6 +218,20 @@ export interface CreateTaskInput {
    * caller sees the error rather than silently persisting garbage.
    */
   schedule_constraint?: SchedulingConstraint | string | null;
+  /**
+   * Optional soft dependency — the id of another task this row
+   * depends on. Purely informational (not blocking). Must reference
+   * a task belonging to `user_id`; must not reference the row being
+   * created (self-reference is refused). null / undefined = no link.
+   */
+  depends_on_task_id?: number | null;
+  /**
+   * Optional parent pointer (this row becomes a subtask of it).
+   * Same user-scoping and self-reference rules as depends_on.
+   * Enforcement of the "cannot mark parent done with open subtasks"
+   * gate lives in updateTaskStatus — create/edit never block on it.
+   */
+  parent_task_id?: number | null;
 }
 
 export async function createTask(db: D1Database, input: CreateTaskInput): Promise<Task> {
@@ -155,13 +243,26 @@ export async function createTask(db: D1Database, input: CreateTaskInput): Promis
   const timeEstimate = normaliseTimeEstimate(input.time_estimate_minutes);
   const constraintJson = normaliseConstraintForWrite(input.schedule_constraint);
 
+  // Relationship pointers. Validated up front against the SAME user
+  // so a stray cross-user id can't sneak in; a self-reference on
+  // create is only possible via a stale AI hallucination (the row
+  // has no id yet), so we skip that check here and let editTask
+  // catch it on later edits.
+  const dependsOn = await validateRelationTarget(
+    db, input.user_id, input.depends_on_task_id, null, 'depends_on_task_id',
+  );
+  const parentId = await validateRelationTarget(
+    db, input.user_id, input.parent_task_id, null, 'parent_task_id',
+  );
+
   const result = await db.prepare(
     `INSERT INTO tasks
        (user_id, title, status, priority, context_note, scheduled_for,
         is_recurring, recurrence_rule, time_estimate_minutes,
         schedule_constraint, missed_cycle_key,
+        depends_on_task_id, parent_task_id,
         created_at, updated_at)
-     VALUES (?1, ?2, 'pending', ?3, ?4, ?5, ?6, ?7, ?8, ?9, NULL, ?10, ?10)
+     VALUES (?1, ?2, 'pending', ?3, ?4, ?5, ?6, ?7, ?8, ?9, NULL, ?10, ?11, ?12, ?12)
      RETURNING *`,
   ).bind(
     input.user_id,
@@ -173,6 +274,8 @@ export async function createTask(db: D1Database, input: CreateTaskInput): Promis
     ruleJson,
     timeEstimate,
     constraintJson,
+    dependsOn,
+    parentId,
     now,
   ).first<Task>();
 
@@ -187,6 +290,27 @@ export async function updateTaskStatus(
   const now = nowIso();
   const completedAt = status === 'done' ? now : null;
   const cancelReason = status === 'cancelled' ? extras?.cancel_reason ?? null : null;
+
+  // Parent/subtask gate.
+  //
+  // The parent-task rule is HARD: a task that has any open subtask
+  // (pending / in_progress / paused) cannot transition to 'done'.
+  // We enforce it here, in the single write path every caller — AI
+  // tool executor, direct slash command, button flow — already
+  // funnels through, so no path can accidentally bypass it.
+  //
+  // Only 'done' is gated: cancelling a parent while subtasks remain
+  // is legitimate ("drop this whole thing"), and pause/resume don't
+  // claim completion. Cancellation of a parent does NOT recursively
+  // cancel its subtasks — that would be surprising in a way "drop
+  // the umbrella" doesn't imply, and users can cancel each child
+  // themselves if that's what they want.
+  if (status === 'done') {
+    const openChildren = await listOpenSubtaskIds(db, userId, id);
+    if (openChildren.length > 0) {
+      throw new ParentHasOpenSubtasksError(id, openChildren);
+    }
+  }
 
   // Completing (or cancelling) a task clears any lingering
   // missed_cycle_key: whatever cycle was flagged as missed is
@@ -231,6 +355,23 @@ export interface EditFields {
    * same way create does.
    */
   schedule_constraint?: SchedulingConstraint | string | null;
+  /**
+   * Soft dependency pointer. `undefined` leaves it alone; `null`
+   * clears it; a number sets/replaces it. Same user-scope and self-
+   * reference validation as the create path.
+   */
+  depends_on_task_id?: number | null;
+  /**
+   * Parent pointer. Same `undefined` = leave alone, `null` = clear,
+   * number = set semantics as depends_on_task_id above. Setting
+   * this on a row that already has open subtasks is legal — a task
+   * can be both a parent AND a subtask of another (a grandchild
+   * relationship). We DO refuse a direct self-parenting on edit
+   * (`parent_task_id = id`); deeper cycle detection is deferred to
+   * a future pass because it never comes up organically — users
+   * don't ask to point a task at itself through a chain by hand.
+   */
+  parent_task_id?: number | null;
 }
 
 export async function editTask(
@@ -238,6 +379,28 @@ export async function editTask(
 ): Promise<Task | null> {
   const existing = await getTaskById(db, userId, id);
   if (!existing) return null;
+
+  // Same status gate updateTaskStatus applies — if this edit is
+  // trying to slip a parent into 'done' via the fields.status path
+  // (the AI's edit_task tool, /edittask status=done, the button
+  // flow's status picker) it must still respect the subtask rule.
+  if (fields.status === 'done') {
+    const openChildren = await listOpenSubtaskIds(db, userId, id);
+    if (openChildren.length > 0) {
+      throw new ParentHasOpenSubtasksError(id, openChildren);
+    }
+  }
+
+  // Relationship-pointer patches. `undefined` = leave alone, `null`
+  // = clear. Validation goes through the same helper createTask
+  // uses, plus the extra self-reference check that only becomes
+  // possible once the row has an id.
+  const dependsOn = fields.depends_on_task_id === undefined
+    ? existing.depends_on_task_id
+    : await validateRelationTarget(db, userId, fields.depends_on_task_id, id, 'depends_on_task_id');
+  const parentId = fields.parent_task_id === undefined
+    ? existing.parent_task_id
+    : await validateRelationTarget(db, userId, fields.parent_task_id, id, 'parent_task_id');
 
   const merged = {
     title: fields.title ?? existing.title,
@@ -259,6 +422,8 @@ export async function editTask(
     schedule_constraint: fields.schedule_constraint !== undefined
       ? normaliseConstraintForWrite(fields.schedule_constraint)
       : existing.schedule_constraint,
+    depends_on_task_id: dependsOn,
+    parent_task_id: parentId,
     // Rewriting the constraint or the recurrence rule invalidates
     // any previously-recorded missed cycle: the definition of the
     // window it belonged to has changed. Editing anything else
@@ -276,6 +441,8 @@ export async function editTask(
             time_estimate_minutes = ?10,
             schedule_constraint = ?11,
             missed_cycle_key = ?12,
+            depends_on_task_id = ?14,
+            parent_task_id = ?15,
             updated_at = ?13
       WHERE id = ?1 AND user_id = ?2
       RETURNING *`,
@@ -287,6 +454,8 @@ export async function editTask(
     merged.schedule_constraint,
     merged.missed_cycle_key,
     nowIso(),
+    merged.depends_on_task_id,
+    merged.parent_task_id,
   ).first<Task>();
 
   return row ?? null;
@@ -409,6 +578,46 @@ function normaliseTimeEstimate(v: number | null | undefined): number | null {
   if (n <= 0) return null;
   // A soft upper cap so a stray "1440000" doesn't land in the DB.
   return Math.min(n, 60 * 24 * 30);
+}
+
+/**
+ * Shared user-scoped validator for both relationship-pointer columns
+ * (depends_on_task_id, parent_task_id). Returns the id to store or
+ * null when the caller is clearing the pointer.
+ *
+ *   - `null` or `undefined` -> null (clear / leave-blank).
+ *   - A number that IS `selfId` -> refused (a task can't point at
+ *     itself).
+ *   - A number pointing at a row that doesn't exist or belongs to
+ *     another user -> refused. The user-scope check is what keeps
+ *     cross-user references from ever landing in the DB; the
+ *     schema's REFERENCES clause alone wouldn't catch that.
+ *
+ * Kept file-local because the two columns are the only callers and
+ * the validation intentionally lives right next to the write path
+ * it protects.
+ */
+async function validateRelationTarget(
+  db: D1Database,
+  userId: number,
+  targetId: number | null | undefined,
+  selfId: number | null,
+  fieldName: string,
+): Promise<number | null> {
+  if (targetId === null || targetId === undefined) return null;
+  if (!Number.isFinite(targetId) || targetId <= 0) {
+    throw new Error(`${fieldName}: expected a positive task id, got ${targetId}`);
+  }
+  if (selfId !== null && targetId === selfId) {
+    throw new Error(`${fieldName}: a task cannot reference itself (#${selfId})`);
+  }
+  const row = await db.prepare(
+    `SELECT id FROM tasks WHERE id = ?1 AND user_id = ?2`,
+  ).bind(targetId, userId).first<{ id: number }>();
+  if (!row) {
+    throw new Error(`${fieldName}: no task #${targetId} on your list`);
+  }
+  return targetId;
 }
 
 /**
