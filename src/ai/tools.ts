@@ -102,6 +102,16 @@ export const TOOL_DECLARATIONS = [
             'Optional rough duration in minutes. Set it when the user hints at how long the task takes ("quick 5-min call", "spend an hour on X", "half-day thing"); otherwise leave empty. Whole minutes, positive.',
         },
         schedule_constraint: SCHEDULE_CONSTRAINT_SCHEMA,
+        depends_on_task_id: {
+          type: 'INTEGER',
+          description:
+            'Optional SOFT dependency — the id of another task this new task can\'t reasonably start until. Purely informational: no write blocks on it, but the nudger will skip suggesting a task whose dependency is still open, and listings show a ⛓ marker. Must reference a task on the same user\'s list. Omit for no dependency.',
+        },
+        parent_task_id: {
+          type: 'INTEGER',
+          description:
+            'Optional parent pointer — set this to make the new task a SUBTASK of the given parent task. Task must belong to the same user. A parent task cannot be marked done while any subtask is still open (pending / in_progress / paused) — update_task_status and edit_task will refuse the status change and name the open subtasks. Omit for a top-level task.',
+        },
       },
       required: ['title', 'priority'],
     },
@@ -180,14 +190,14 @@ export const TOOL_DECLARATIONS = [
   },
   {
     name: 'edit_task',
-    description: 'Edit fields on an existing task (title, priority letter grade, context, scheduling, recurrence, time estimate, schedule_constraint). Pass schedule_constraint=null to clear a previously-set constraint.',
+    description: 'Edit fields on an existing task (title, priority letter grade, context, scheduling, recurrence, time estimate, schedule_constraint, dependency pointer, parent pointer). Pass schedule_constraint=null / depends_on_task_id=null / parent_task_id=null to clear a previously-set value. NOTE: attempting to move a parent task to status="done" while any of its subtasks is still open (pending / in_progress / paused) will fail with a structured error naming the blocking subtask ids — finish or cancel those first.',
     parameters: {
       type: 'OBJECT',
       properties: {
         task_id: { type: 'INTEGER' },
         fields: {
           type: 'OBJECT',
-          description: 'Any subset of: title, priority (letter grade A+..E-), context_note, scheduled_for, is_recurring, recurrence_rule, status, time_estimate_minutes, schedule_constraint.',
+          description: 'Any subset of: title, priority (letter grade A+..E-), context_note, scheduled_for, is_recurring, recurrence_rule, status, time_estimate_minutes, schedule_constraint, depends_on_task_id, parent_task_id.',
           properties: {
             title: { type: 'STRING' },
             priority: {
@@ -210,6 +220,16 @@ export const TOOL_DECLARATIONS = [
               description: 'Rough duration in minutes. Positive whole number; pass 0 or negative to clear it.',
             },
             schedule_constraint: SCHEDULE_CONSTRAINT_SCHEMA,
+            depends_on_task_id: {
+              type: 'INTEGER',
+              description:
+                'Set/replace the soft dependency pointer to this task id (must belong to the same user, must not be this task\'s own id). Pass 0 or a negative number to CLEAR the dependency. Leave the field absent to keep the existing value.',
+            },
+            parent_task_id: {
+              type: 'INTEGER',
+              description:
+                'Set/replace the parent pointer — makes this task a subtask of the given id (must belong to the same user, must not be this task\'s own id). Pass 0 or a negative number to CLEAR the parent (detach from the current parent, becoming top-level again). Leave the field absent to keep the existing value.',
+            },
           },
         },
       },
