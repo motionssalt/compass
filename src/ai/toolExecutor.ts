@@ -7,6 +7,7 @@ import {
   createTask, updateTaskStatus, cancelTask, listTasksByFilter,
   editTask, deleteTask,
   parseScheduleConstraint, safeParseStoredConstraint,
+  ParentHasOpenSubtasksError,
 } from '../db/tasks';
 import type { TaskStatus } from '../types/task';
 import {
@@ -185,6 +186,8 @@ async function handleCreate(env: Env, userId: number, args: Record<string, unkno
       recurrence_rule: rule ?? null,
       time_estimate_minutes: parseTimeEstimateArg(args.time_estimate_minutes),
       schedule_constraint: constraint.value,
+      depends_on_task_id: parseRelationArg(args.depends_on_task_id),
+      parent_task_id: parseRelationArg(args.parent_task_id),
     });
     return { name: 'create_task', response: { ok: true, task: decorateTask(task) } };
   } catch (err) {
@@ -209,9 +212,13 @@ async function handleUpdateStatus(env: Env, userId: number, args: Record<string,
   if (!['pending', 'in_progress', 'paused', 'done', 'cancelled'].includes(status)) {
     return { name: 'update_task_status', response: { ok: false, error: `invalid status: ${status}` } };
   }
-  const task = await updateTaskStatus(env.DB, userId, id, status);
-  if (!task) return { name: 'update_task_status', response: { ok: false, error: 'task not found' } };
-  return { name: 'update_task_status', response: { ok: true, task: decorateTask(task) } };
+  try {
+    const task = await updateTaskStatus(env.DB, userId, id, status);
+    if (!task) return { name: 'update_task_status', response: { ok: false, error: 'task not found' } };
+    return { name: 'update_task_status', response: { ok: true, task: decorateTask(task) } };
+  } catch (err) {
+    return subtaskGateResult('update_task_status', err);
+  }
 }
 
 // pause_task / resume_task are thin convenience wrappers around
@@ -222,9 +229,16 @@ async function handleUpdateStatus(env: Env, userId: number, args: Record<string,
 async function handlePauseTask(env: Env, userId: number, args: Record<string, unknown>): Promise<ToolResult> {
   const id = Number(args.task_id);
   if (!id) return { name: 'pause_task', response: { ok: false, error: 'task_id required' } };
-  const task = await updateTaskStatus(env.DB, userId, id, 'paused');
-  if (!task) return { name: 'pause_task', response: { ok: false, error: 'task not found' } };
-  return { name: 'pause_task', response: { ok: true, task: decorateTask(task) } };
+  // pause never trips the subtask-gate ('paused' isn't 'done'), but
+  // keeping the try/catch in one shape makes the tool wrappers
+  // interchangeable if the gate ever widens.
+  try {
+    const task = await updateTaskStatus(env.DB, userId, id, 'paused');
+    if (!task) return { name: 'pause_task', response: { ok: false, error: 'task not found' } };
+    return { name: 'pause_task', response: { ok: true, task: decorateTask(task) } };
+  } catch (err) {
+    return subtaskGateResult('pause_task', err);
+  }
 }
 
 async function handleResumeTask(env: Env, userId: number, args: Record<string, unknown>): Promise<ToolResult> {
@@ -282,19 +296,104 @@ async function handleEdit(env: Env, userId: number, args: Record<string, unknown
     constraintPatch = parsed.value;
   }
 
-  const task = await editTask(env.DB, userId, id, {
-    title: fields.title as string | undefined,
-    priority: fields.priority as string | number | undefined,
-    context_note: fields.context_note as string | null | undefined,
-    scheduled_for: fields.scheduled_for as string | null | undefined,
-    is_recurring: fields.is_recurring as boolean | undefined,
-    recurrence_rule: fields.recurrence_rule as RecurrenceRule | null | undefined,
-    status: fields.status as any,
-    time_estimate_minutes: parseTimeEstimateArg(fields.time_estimate_minutes),
-    schedule_constraint: constraintPatch,
-  });
-  if (!task) return { name: 'edit_task', response: { ok: false, error: 'task not found' } };
-  return { name: 'edit_task', response: { ok: true, task: decorateTask(task) } };
+  // Relationship-pointer patches. Same three-state contract as the
+  // other edit fields: key absent → leave alone, integer > 0 → set,
+  // 0 / negative / explicit null → clear. We route this through
+  // parseRelationPatchArg so the AI's declared INTEGER type stays
+  // meaningful even though "clear" needs an out-of-band signal.
+  const dependsPatch: number | null | undefined = 'depends_on_task_id' in fields
+    ? parseRelationPatchArg(fields.depends_on_task_id)
+    : undefined;
+  const parentPatch: number | null | undefined = 'parent_task_id' in fields
+    ? parseRelationPatchArg(fields.parent_task_id)
+    : undefined;
+
+  try {
+    const task = await editTask(env.DB, userId, id, {
+      title: fields.title as string | undefined,
+      priority: fields.priority as string | number | undefined,
+      context_note: fields.context_note as string | null | undefined,
+      scheduled_for: fields.scheduled_for as string | null | undefined,
+      is_recurring: fields.is_recurring as boolean | undefined,
+      recurrence_rule: fields.recurrence_rule as RecurrenceRule | null | undefined,
+      status: fields.status as any,
+      time_estimate_minutes: parseTimeEstimateArg(fields.time_estimate_minutes),
+      schedule_constraint: constraintPatch,
+      depends_on_task_id: dependsPatch,
+      parent_task_id: parentPatch,
+    });
+    if (!task) return { name: 'edit_task', response: { ok: false, error: 'task not found' } };
+    return { name: 'edit_task', response: { ok: true, task: decorateTask(task) } };
+  } catch (err) {
+    // If the edit tried to slip a parent into 'done' while subtasks
+    // are still open, hand the AI a structured refusal with the
+    // blocking ids named — so it can\'t paraphrase this as a generic
+    // failure or, worse, claim success.
+    if (err instanceof ParentHasOpenSubtasksError) {
+      return subtaskGateResult('edit_task', err);
+    }
+    const message = err instanceof Error ? err.message : String(err);
+    return { name: 'edit_task', response: { ok: false, error: message } };
+  }
+}
+
+/**
+ * Coerce a relation-pointer tool argument (depends_on_task_id,
+ * parent_task_id) on the CREATE path into what tasks.ts expects:
+ *   - undefined / null → null (no pointer)
+ *   - positive integer → that id
+ *   - anything else (0, negative, NaN, non-numeric) → null
+ *
+ * The AI declares these as INTEGER, but Gemini sometimes emits a
+ * bare 0 as a shorthand for "none" — treat that as "no pointer"
+ * instead of failing the write with a bad id.
+ */
+function parseRelationArg(v: unknown): number | null {
+  if (v === undefined || v === null) return null;
+  const n = typeof v === 'number' ? v : Number(v);
+  if (!Number.isFinite(n) || n <= 0) return null;
+  return Math.round(n);
+}
+
+/**
+ * EDIT-path variant. Same rules as parseRelationArg, but preserves
+ * the "leave alone" state — the caller only invokes this when the
+ * key WAS present in `fields`, so:
+ *   - undefined → null (edit path treats a present-but-empty as clear)
+ *   - null / 0 / negative / non-numeric → null (clear)
+ *   - positive integer → that id (set/replace)
+ */
+function parseRelationPatchArg(v: unknown): number | null {
+  if (v === undefined || v === null) return null;
+  const n = typeof v === 'number' ? v : Number(v);
+  if (!Number.isFinite(n) || n <= 0) return null;
+  return Math.round(n);
+}
+
+/**
+ * Shared "parent has open subtasks" translator. Whenever a tool that
+ * can flip a status to 'done' catches a ParentHasOpenSubtasksError,
+ * this shapes the same clear, structured refusal the AI must NOT
+ * paraphrase as a generic failure or claim-of-success. Every non-
+ * subtask-gate error falls through unchanged so the outer executeTool
+ * catch keeps handling it.
+ */
+function subtaskGateResult(toolName: string, err: unknown): ToolResult {
+  if (err instanceof ParentHasOpenSubtasksError) {
+    return {
+      name: toolName,
+      response: {
+        ok: false,
+        error: err.message,
+        error_code: 'parent_has_open_subtasks',
+        parent_task_id: err.parentId,
+        open_subtask_ids: err.openSubtaskIds,
+        hint: 'Do NOT claim the parent is done. Tell the user plainly which subtasks (by the ids above) are still open and blocking, and offer to close or cancel them first. Never rephrase this as a generic failure or a save.',
+      },
+    };
+  }
+  const message = err instanceof Error ? err.message : String(err);
+  return { name: toolName, response: { ok: false, error: message } };
 }
 
 async function handleDelete(env: Env, userId: number, args: Record<string, unknown>): Promise<ToolResult> {
