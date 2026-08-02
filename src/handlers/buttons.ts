@@ -32,6 +32,7 @@ import {
 import {
   listTasksByFilter, listOpenTasks, listAllOpenTasks,
   createTask, editTask, deleteTask, getTaskById, updateTaskStatus,
+  ParentHasOpenSubtasksError,
 } from '../db/tasks';
 import type { TaskStatus } from '../types/task';
 import { resetUserData } from '../db/reset';
@@ -64,8 +65,17 @@ import {
   constraintPartsKeyboard, constraintDaysKeyboard,
   constraintTextPromptKeyboard, describeConstraintForMenu,
   WEEKDAY_CODES, type WeekdayCode,
+  relMenuKeyboard, REL_MENU_TEXT,
+  relSubjectPickerKeyboard,
+  depSetPickerKeyboard, depClrPickerKeyboard,
+  parSetPickerKeyboard, parClrPickerKeyboard,
 } from './menuUi';
-import { parseConstraintExpression } from './directTasks';
+import {
+  parseConstraintExpression,
+  subtaskGateMessage,
+  formatTaskLine as dtFormatTaskLine,
+  renderTaskList,
+} from './directTasks';
 import { safeParseStoredConstraint } from '../utils/scheduleConstraint';
 import type { SchedulingConstraint } from '../types/shared';
 import { log } from '../utils/logger';
@@ -342,6 +352,67 @@ async function handleTasks(
     );
     await clearFlow(env.DB, userId);
     return ok ? 'deleted' : 'not found';
+  }
+
+  if (action === 'rel') {
+    await editOrSend(env, msg, REL_MENU_TEXT, relMenuKeyboard());
+    return;
+  }
+
+  if (action === 'depsetpick') {
+    // Step 1: pick WHICH task to set a dependency ON (the subject).
+    const open = await listAllOpenTasks(env.DB, userId);
+    if (open.length === 0) {
+      await editOrSend(env, msg, `No open tasks.`, tasksMenuKeyboard());
+      return;
+    }
+    await editOrSend(env, msg,
+      `Which task needs a dependency? (Pick the blocked task.)`,
+      relSubjectPickerKeyboard(open, 'dep'),
+    );
+    return;
+  }
+
+  if (action === 'depclrpick') {
+    const open = await listAllOpenTasks(env.DB, userId);
+    const hasDep = open.filter((t) => t.depends_on_task_id != null);
+    if (hasDep.length === 0) {
+      await editOrSend(env, msg, `No tasks with a dependency set.`, relMenuKeyboard());
+      return;
+    }
+    await editOrSend(env, msg,
+      `Pick a task to clear its dependency:`,
+      depClrPickerKeyboard(hasDep),
+    );
+    return;
+  }
+
+  if (action === 'parsetpick') {
+    // Step 1: pick WHICH task to make into a subtask (the subject).
+    const open = await listAllOpenTasks(env.DB, userId);
+    if (open.length === 0) {
+      await editOrSend(env, msg, `No open tasks.`, tasksMenuKeyboard());
+      return;
+    }
+    await editOrSend(env, msg,
+      `Which task should become a subtask? (Pick the child task.)`,
+      relSubjectPickerKeyboard(open, 'par'),
+    );
+    return;
+  }
+
+  if (action === 'parclrpick') {
+    const open = await listAllOpenTasks(env.DB, userId);
+    const hasPar = open.filter((t) => t.parent_task_id != null);
+    if (hasPar.length === 0) {
+      await editOrSend(env, msg, `No tasks with a parent set.`, relMenuKeyboard());
+      return;
+    }
+    await editOrSend(env, msg,
+      `Pick a subtask to detach from its parent:`,
+      parClrPickerKeyboard(hasPar),
+    );
+    return;
   }
 
   return 'unknown';
@@ -946,6 +1017,133 @@ async function handleFlow(
       await editOrSend(env, msg, `No task #${id}.`, tasksMenuKeyboard());
     } else {
       await editOrSend(env, msg, `Updated: ${formatTaskLine(updated)}`, tasksMenuKeyboard());
+    }
+    await clearFlow(env.DB, userId);
+    return 'done';
+  }
+
+  // Step 1 result: user picked which task is the SUBJECT of the
+  // dep-set or par-set flow. Now show the TARGET picker.
+  if (action === 'relsub') {
+    const purpose = args[0]; // 'dep' | 'par'
+    const subjectId = parseInt(args[1] ?? '', 10);
+    if ((purpose !== 'dep' && purpose !== 'par') || !Number.isFinite(subjectId) || subjectId <= 0) {
+      return 'bad args';
+    }
+    const open = await listAllOpenTasks(env.DB, userId);
+    if (purpose === 'dep') {
+      const targets = open.filter((t) => t.id !== subjectId);
+      if (targets.length === 0) {
+        await editOrSend(env, msg, `No other open tasks to depend on.`, relMenuKeyboard());
+        return;
+      }
+      await editOrSend(env, msg,
+        `#${subjectId} will depend on which task? (Must complete the chosen task first.)`,
+        depSetPickerKeyboard(open, subjectId),
+      );
+    } else {
+      const targets = open.filter((t) => t.id !== subjectId);
+      if (targets.length === 0) {
+        await editOrSend(env, msg, `No other open tasks to be a subtask of.`, relMenuKeyboard());
+        return;
+      }
+      await editOrSend(env, msg,
+        `#${subjectId} will be a subtask of which task?`,
+        parSetPickerKeyboard(open, subjectId),
+      );
+    }
+    return;
+  }
+
+  // Step 2 (dep-set): write depends_on_task_id on the subject.
+  if (action === 'depset') {
+    const subjectId = parseInt(args[0] ?? '', 10);
+    const targetId  = parseInt(args[1] ?? '', 10);
+    if (!Number.isFinite(subjectId) || !Number.isFinite(targetId)) return 'bad args';
+    let updated;
+    try {
+      updated = await editTask(env.DB, userId, subjectId, { depends_on_task_id: targetId });
+    } catch (err) {
+      if (err instanceof ParentHasOpenSubtasksError) {
+        await editOrSend(env, msg, subtaskGateMessage(err.parentId, err.openSubtaskIds), tasksMenuKeyboard());
+        await clearFlow(env.DB, userId);
+        return 'gate';
+      }
+      throw err;
+    }
+    const now = new Date();
+    if (!updated) {
+      await editOrSend(env, msg, `No task #${subjectId}.`, relMenuKeyboard());
+    } else {
+      await editOrSend(env, msg,
+        `Dependency set: ${dtFormatTaskLine(updated, now)} now blocked by #${targetId}.`,
+        relMenuKeyboard(),
+      );
+    }
+    await clearFlow(env.DB, userId);
+    return 'done';
+  }
+
+  // Dependency-clear: remove depends_on_task_id from the chosen task.
+  if (action === 'depclr') {
+    const subjectId = parseInt(args[0] ?? '', 10);
+    if (!Number.isFinite(subjectId)) return 'bad id';
+    const updated = await editTask(env.DB, userId, subjectId, { depends_on_task_id: null });
+    const now = new Date();
+    if (!updated) {
+      await editOrSend(env, msg, `No task #${subjectId}.`, relMenuKeyboard());
+    } else {
+      await editOrSend(env, msg,
+        `Dependency cleared: ${dtFormatTaskLine(updated, now)}`,
+        relMenuKeyboard(),
+      );
+    }
+    await clearFlow(env.DB, userId);
+    return 'done';
+  }
+
+  // Step 2 (par-set): write parent_task_id on the subject.
+  if (action === 'parset') {
+    const subjectId = parseInt(args[0] ?? '', 10);
+    const parentId  = parseInt(args[1] ?? '', 10);
+    if (!Number.isFinite(subjectId) || !Number.isFinite(parentId)) return 'bad args';
+    let updated;
+    try {
+      updated = await editTask(env.DB, userId, subjectId, { parent_task_id: parentId });
+    } catch (err) {
+      if (err instanceof ParentHasOpenSubtasksError) {
+        await editOrSend(env, msg, subtaskGateMessage(err.parentId, err.openSubtaskIds), tasksMenuKeyboard());
+        await clearFlow(env.DB, userId);
+        return 'gate';
+      }
+      throw err;
+    }
+    const now = new Date();
+    if (!updated) {
+      await editOrSend(env, msg, `No task #${subjectId}.`, relMenuKeyboard());
+    } else {
+      await editOrSend(env, msg,
+        `Parent set: ${dtFormatTaskLine(updated, now)} is now a subtask of #${parentId}.`,
+        relMenuKeyboard(),
+      );
+    }
+    await clearFlow(env.DB, userId);
+    return 'done';
+  }
+
+  // Parent-clear: remove parent_task_id from the chosen subtask.
+  if (action === 'parclr') {
+    const subjectId = parseInt(args[0] ?? '', 10);
+    if (!Number.isFinite(subjectId)) return 'bad id';
+    const updated = await editTask(env.DB, userId, subjectId, { parent_task_id: null });
+    const now = new Date();
+    if (!updated) {
+      await editOrSend(env, msg, `No task #${subjectId}.`, relMenuKeyboard());
+    } else {
+      await editOrSend(env, msg,
+        `Parent cleared: ${dtFormatTaskLine(updated, now)}`,
+        relMenuKeyboard(),
+      );
     }
     await clearFlow(env.DB, userId);
     return 'done';
@@ -1615,19 +1813,21 @@ function cancelOnlyKeyboard(): InlineKeyboardMarkup {
   return { inline_keyboard: [[{ text: '✖️ Cancel', callback_data: '1:flow:cancel' }]] };
 }
 
+/** Thin shim so the many call-sites inside this file that pass no `now`
+ *  arg stay unchanged — they get a fresh Date() each time, which is fine
+ *  for display purposes.  The exported dtFormatTaskLine from directTasks
+ *  is used directly in the new relationship handlers that already have a
+ *  captured `now`.
+ */
 function formatTaskLine(t: {
   id: number; title: string; priority: number;
   time_estimate_minutes: number | null;
   scheduled_for: string | null; status: string;
+  depends_on_task_id?: number | null;
+  parent_task_id?: number | null;
+  scheduled_for_parsed?: unknown;
 }): string {
-  const bits = [`#${t.id} ${t.title}`];
-  if (t.priority && t.priority !== DEFAULT_PRIORITY_INT) {
-    bits.push(`(${priorityIntToLetter(t.priority)})`);
-  }
-  if (t.time_estimate_minutes && t.time_estimate_minutes > 0) {
-    bits.push(`~${t.time_estimate_minutes}min`);
-  }
-  if (t.scheduled_for) bits.push(`— ${t.scheduled_for}`);
-  if (t.status !== 'pending') bits.push(`[${t.status}]`);
-  return `• ${bits.join(' ')}`;
+  // Cast to Task-ish: dtFormatTaskLine needs created_at for urgency;
+  // we supply a sentinel so it never errors.
+  return dtFormatTaskLine(t as Parameters<typeof dtFormatTaskLine>[0], new Date());
 }
