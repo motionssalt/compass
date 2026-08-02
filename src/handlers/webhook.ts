@@ -26,7 +26,7 @@ import { arrayBufferToBase64 } from '../utils/base64';
 import {
   cmdAddTask, cmdAddBatch, cmdEditTask, cmdReviewFlexible,
   cmdPauseTask, cmdResumeTask, cmdStartTask, cmdFinishTask,
-  cmdSchedule,
+  cmdSchedule, cmdSubtask,
 } from './directTasks';
 import {
   processCallbackQuery, openMenu, tryHandleFlowText,
@@ -194,7 +194,12 @@ async function handleSlashCommand(env: Env, msg: TelegramMessage): Promise<boole
         `/finishtask <id> — mark a task as done yourself (also /done)\n` +
         `/pause <id> — pause a task: still visible, but skipped by free-time nudges and "what's active now"\n` +
         `/resume <id> — unpause a task, back into the nudge pool\n` +
-        `/review — list your flexible (unscheduled) tasks, highest priority first (also /flex)\n\n` +
+        `/review — list your flexible (unscheduled) tasks, highest priority first (also /flex)\n` +
+        `/subtask <parent_id> <title> [| p=B] [| dur=30] — add a subtask under an existing task\n\n` +
+        `Dependencies & relationships (editable via /addtask, /addbatch, /edittask, and the menu ⛓):` +
+        `\n  depends=<id>  (or dep=, blocked_by=, after=) — task won't be nudged until dependency is done\n` +
+        `  parent=<id>   (or sub_of=, subtask_of=)        — make this a subtask of another task\n` +
+        `  depends=clear / parent=clear                   — remove the link\n\n` +
         `Finance:\n` +
         `/balance — current balance\n` +
         `/debts — open debts\n` +
@@ -430,6 +435,12 @@ async function handleSlashCommand(env: Env, msg: TelegramMessage): Promise<boole
       // edit_task tool, and the button flow's Constraint editor all
       // funnel through — no forked logic.
       const reply = await cmdSchedule(env, userId, argStr);
+      await sendMessage(env, msg.chat.id, reply);
+      return true;
+    }
+
+    case '/subtask': {
+      const reply = await cmdSubtask(env, userId, argStr);
       await sendMessage(env, msg.chat.id, reply);
       return true;
     }
