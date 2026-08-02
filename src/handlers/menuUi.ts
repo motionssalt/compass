@@ -110,6 +110,7 @@ export function tasksMenuKeyboard(): InlineKeyboardMarkup {
       btn('▶️ Resume', cb('tasks', 'resumepick')),
     ],
     [btn('🗑️ Delete task',   cb('tasks', 'delpick'))],
+    [btn('⛓ Dependencies / Parents', cb('tasks', 'rel'))],
     [btn('« Back',           cb('nav',   'root'))],
   ]);
 }
@@ -509,3 +510,122 @@ export function resetConfirmKeyboard(token: string): InlineKeyboardMarkup {
     ],
   ]);
 }
+
+// ---------------------------------------------------------------
+// Dependency / parent-task picker keyboards
+// ---------------------------------------------------------------
+//
+// These keyboards follow the exact same task-picker pattern already
+// used by editpick / delpick / startpick. callback_data stays within
+// 64 bytes: the domain is 'flow', the action names are short, and
+// only the task id is carried — no free-form text.
+//
+// Four new picker actions in buttons.ts handle:
+//   depsetpick  — pick the task this one depends on (set)
+//   depclrpick  — pick the task to clear its dependency
+//   parsetpick  — pick a parent (making this a subtask of it)
+//   parclrpick  — pick the subtask whose parent pointer to clear
+//
+// Both "clear" pickers write depends_on_task_id=null /
+// parent_task_id=null through editTask — same path as the tag.
+
+/**
+ * Dependency-set picker: choose which task to set as the dependency
+ * of `subjectId`. Lists open tasks except `subjectId` itself.
+ */
+export function depSetPickerKeyboard(
+  tasks: { id: number; title: string; priority: number }[],
+  subjectId: number,
+): InlineKeyboardMarkup {
+  const rows: InlineKeyboardButton[][] = [];
+  for (const t of tasks.filter((t) => t.id !== subjectId).slice(0, 12)) {
+    const short = t.title.length > 38 ? `${t.title.slice(0, 37)}…` : t.title;
+    rows.push([btn(`#${t.id} ${short}`, cb('flow', 'depset', String(subjectId), String(t.id)))]);
+  }
+  rows.push([btn('✖️ Cancel', cb('flow', 'cancel'))]);
+  return keyboard(rows);
+}
+
+/**
+ * Dependency-clear picker: choose which task to remove its depends_on
+ * pointer from (lists only tasks that currently have one set).
+ */
+export function depClrPickerKeyboard(
+  tasks: { id: number; title: string; priority: number; depends_on_task_id: number | null }[],
+): InlineKeyboardMarkup {
+  const rows: InlineKeyboardButton[][] = [];
+  for (const t of tasks.filter((t) => t.depends_on_task_id != null).slice(0, 12)) {
+    const short = t.title.length > 34 ? `${t.title.slice(0, 33)}…` : t.title;
+    rows.push([btn(`#${t.id} ${short} ⛓#${t.depends_on_task_id}`, cb('flow', 'depclr', String(t.id)))]);
+  }
+  rows.push([btn('✖️ Cancel', cb('flow', 'cancel'))]);
+  return keyboard(rows);
+}
+
+/**
+ * Parent-set picker: choose which task to set as the parent of
+ * `subjectId` (making it a subtask). Lists open tasks except subject.
+ */
+export function parSetPickerKeyboard(
+  tasks: { id: number; title: string; priority: number }[],
+  subjectId: number,
+): InlineKeyboardMarkup {
+  const rows: InlineKeyboardButton[][] = [];
+  for (const t of tasks.filter((t) => t.id !== subjectId).slice(0, 12)) {
+    const short = t.title.length > 38 ? `${t.title.slice(0, 37)}…` : t.title;
+    rows.push([btn(`#${t.id} ${short}`, cb('flow', 'parset', String(subjectId), String(t.id)))]);
+  }
+  rows.push([btn('✖️ Cancel', cb('flow', 'cancel'))]);
+  return keyboard(rows);
+}
+
+/**
+ * Parent-clear picker: choose which task to detach from its parent
+ * (lists only tasks that currently have a parent_task_id set).
+ */
+export function parClrPickerKeyboard(
+  tasks: { id: number; title: string; priority: number; parent_task_id: number | null }[],
+): InlineKeyboardMarkup {
+  const rows: InlineKeyboardButton[][] = [];
+  for (const t of tasks.filter((t) => t.parent_task_id != null).slice(0, 12)) {
+    const short = t.title.length > 34 ? `${t.title.slice(0, 33)}…` : t.title;
+    rows.push([btn(`#${t.id} ${short} ↳#${t.parent_task_id}`, cb('flow', 'parclr', String(t.id)))]);
+  }
+  rows.push([btn('✖️ Cancel', cb('flow', 'cancel'))]);
+  return keyboard(rows);
+}
+
+/**
+ * Subject-task picker for "which task do you want to set a dep/parent
+ * ON?". Used as step 1 of both the dep-set and par-set flows before
+ * step 2 shows the target picker. Purpose token tells buttons.ts
+ * whether step 2 is a dep or par picker.
+ */
+export function relSubjectPickerKeyboard(
+  tasks: { id: number; title: string; priority: number }[],
+  purpose: 'dep' | 'par',
+): InlineKeyboardMarkup {
+  const rows: InlineKeyboardButton[][] = [];
+  for (const t of tasks.slice(0, 12)) {
+    const short = t.title.length > 40 ? `${t.title.slice(0, 39)}…` : t.title;
+    rows.push([btn(`#${t.id} ${short}`, cb('flow', 'relsub', purpose, String(t.id)))]);
+  }
+  rows.push([btn('✖️ Cancel', cb('flow', 'cancel'))]);
+  return keyboard(rows);
+}
+
+/**
+ * Dependency/parent action sub-menu. Shown when the user taps
+ * "⛓ Dependencies / Parents" from the tasks sub-menu.
+ */
+export function relMenuKeyboard(): InlineKeyboardMarkup {
+  return keyboard([
+    [btn('⛓ Set dependency',      cb('tasks', 'depsetpick'))],
+    [btn('🔓 Clear dependency',    cb('tasks', 'depclrpick'))],
+    [btn('↳ Set parent (subtask)', cb('tasks', 'parsetpick'))],
+    [btn('↑ Clear parent',         cb('tasks', 'parclrpick'))],
+    [btn('« Back',                 cb('nav',   'tasks'))],
+  ]);
+}
+
+export const REL_MENU_TEXT = `Dependencies & Parents — pick an action:`;
