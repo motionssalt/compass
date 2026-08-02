@@ -422,6 +422,83 @@ webhook at the tunnel URL.
 
 ---
 
+---
+
+## Task dependencies, parent/subtask relationships, and deadline urgency
+
+### Dependencies (`depends_on_task_id`)
+
+A task can **depend on** another open task. A blocked task:
+
+- Is skipped by the free-time nudger until the dependency is cleared
+  (only unblocked tasks are suggested).
+- Shows a `⛓ depends=#N` glyph in `/addtask`, `/edittask`, and
+  `/alltasks` output so you see the link at a glance.
+- The AI sees `depends_on=#N` in its context each turn so it can
+  reason about blocking chains.
+
+**Set a dependency:**
+
+```
+/addtask Write intro | depends=3
+/addbatch
+Draft outline | depends=5
+---
+/edittask 12 | depends=5
+/edittask 12 | depends=clear
+```
+
+Aliases: `dep=`, `depends_on=`, `blocked_by=`, `after=`
+
+Via the button menu: **Tasks → ⛓ Dependencies / Parents → Set dependency**
+
+### Parent / subtask (`parent_task_id`)
+
+A task can be a **subtask** of another. Compass enforces:
+
+- A parent task **cannot be marked done** while any subtask is still
+  open (`pending`, `in_progress`, or `paused`). A clear error message
+  names the blocking subtask ids.
+- The nudger skips the parent and nudges the subtask instead (make
+  progress on the work, not the wrapper).
+- Subtasks show a `↳ subtask-of #N` glyph; parent tasks show their
+  children indented in `renderTaskList` output.
+
+**Add a subtask:**
+
+```
+/subtask 5 Write intro section
+/subtask 5 Write intro section | p=B | dur=30
+/addtask Write intro | parent=5
+/edittask 12 | parent=5
+/edittask 12 | parent=clear
+```
+
+Aliases: `sub_of=`, `subof=`, `subtask_of=`
+
+Via the button menu: **Tasks → ⛓ Dependencies / Parents → Set parent (subtask)**
+
+### Deadline-aware urgency
+
+`src/utils/urgency.ts` classifies any task that has a hard
+`scheduled_for` date or a constraint date-range into urgency buckets:
+
+| Bucket     | Meaning                    | Score boost |
+|------------|----------------------------|-------------|
+| `overdue`  | Deadline already passed    | +200        |
+| `imminent` | < 24 h away                | +100        |
+| `today`    | Due today                  | +60         |
+| `soon`     | < 3 days                   | +30         |
+| `this_week`| < 7 days                   | +10         |
+| `far`      | ≥ 7 days or no deadline    | 0           |
+
+These boosts layer on top of priority + age + fit scoring in the nudger
+so an imminent task surfaces above an otherwise-equal long-runway task.
+The AI receives a compact urgency label (e.g. `urgency=⏳ today`) in
+its per-task context every turn. Stored priority is **never modified**
+by the urgency system — it is a display and scoring overlay only.
+
+
 ## Scheduling constraints
 
 Every task can carry an optional **scheduling constraint** on top of
